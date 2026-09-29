@@ -16,8 +16,24 @@ cloudinary.config({
 });
 
 const app = express();
+
+const cleanOrigins = (v) => {
+  if (!v || v === '*') return '*';
+  return v
+    .split(',')
+    .map((s) => s.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+};
 const corsOptions = {
-  origin: CLIENT_URL === '*' ? '*' : CLIENT_URL.split(',').map((s) => s.trim()),
+  origin: (origin, cb) => {
+    const allowed = cleanOrigins(process.env.CLIENT_URL);
+    if (allowed === '*' || !origin) return cb(null, true);
+    if (allowed.includes(origin)) return cb(null, true);
+    // Allow localhost for dev
+    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
+    if (/^http:\/\/192\.168\./.test(origin)) return cb(null, true);
+    cb(new Error('Not allowed by CORS'));
+  },
   methods: ['GET', 'POST'],
   credentials: true,
 };
