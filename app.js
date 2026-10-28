@@ -1,0 +1,381 @@
+import 'dotenv/config';
+import express from 'express';
+import http from 'node:http';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { randomUUID, randomBytes, createHash, randomInt } from 'node:crypto';
+import { Server } from 'socket.io';
+import cors from 'cors';
+import multer from 'multer';
+import { v2 as cloudinary } from 'cloudinary';
+import webpush from 'web-push';
+import { writeJsonAtomically } from './storage.js';
+
+const root = path.dirname(fileURLToPath(import.meta.url));
+const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, 'data'));
+const uploadsDir = path.join(dataDir, 'uploads');
+fs.mkdirSync(uploadsDir, { recursive: true });
+const dataFile = path.join(dataDir, 'chat.json');
+const empty = { accounts: {}, sessions: {}, history: {}, groups: {}, prefs: {}, statuses: [], calls: [], subscriptions: {} };
+// Refuse to silently replace a corrupt database.
+const db = fs.existsSync(dataFile) ? { ...empty, ...JSON.parse(fs.readFileSync(dataFile, 'utf8')) } : empty;
+const save = () => writeJsonAtomically(dataFile, db);
+const vapidFile = path.join(dataDir, 'vapid.json');
+const vapid = fs.existsSync(vapidFile) ? JSON.parse(fs.readFileSync(vapidFile, 'utf8')) : webpush.generateVAPIDKeys();
+if (!fs.existsSync(vapidFile)) fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 });
+webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapid.publicKey, vapid.privateKey);
+const phoneValid = (p) => /^\d{10}$/.test(p);
+const trim = (v, max = 4000) => String(v || '').trim().slice(0, max);
+const hash = (s) => createHash('sha256').update(String(s)).digest('hex');
+const roomId = (a, b) => b?.startsWith('group:') ? b : [a, b].sort().join('::');
+const prefs = (p) => db.prefs[p] ||= { muted: [], favorites: [], pinned: [], archived: [], blocked: [], starred: [], hidden: [] };
+const online = new Map(), otps = new Map(), activeCalls = new Map();
+const isOnline = (p) => !!online.get(p)?.size;
+const demoAuth = (process.env.AUTH_MODE || 'demo') === 'demo';
+const founderPhone = trim(process.env.FOUNDER_PHONE, 10);
+if (phoneValid(founderPhone) && !db.accounts[founderPhone]) {
+  db.accounts[founderPhone] = { phone: founderPhone, name: trim(process.env.FOUNDER_NAME, 30) || 'Site founder', about: 'Founder · Ask a question or send feedback', joinedAt: Date.now(), lastSeen: null };
+}
+const app = express();
+app.disable('x-powered-by');
+const origin = (value, cb) => {
+  const allowed = (process.env.CLIENT_URL || '*').split(',').map((s) => s.trim().replace(/\/+$/, ''));
+  cb(null, !value || allowed.includes('*') || allowed.includes(value) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(value));
+};
+app.use(cors({ origin, credentials: true }));
+app.use(express.json({ limit: '256kb' }));
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin, methods: ['GET', 'POST'] }, maxHttpBufferSize: 256 * 1024 });
+const emitTo = (people, event, data) => io.to([...new Set(people)].map((p) => `user:${p}`)).emit(event, data);
+const usersPublic = () => Object.values(db.accounts).map(({ phone, name, about, joinedAt, lastSeen }) => ({ phone, name, about, joinedAt, lastSeen, online: isOnline(phone), isFounder: phone === founderPhone }));
+const broadcastUsers = () => emitTo([...online.keys()], 'users', usersPublic());
+const membersOf = (rid) => rid.startsWith('group:') ? db.groups[rid]?.members || [] : rid.split('::');
+const canRead = (me, rid) => membersOf(rid).includes(me);
+const blocked = (a, b) => prefs(a).blocked.includes(b) || prefs(b).blocked.includes(a);
+const messageStatus = (m) => {
+  const recipients = (m.members || membersOf(m.roomId)).filter((p) => p !== m.from);
+  return recipients.every((p) => m.readBy?.includes(p)) ? 'seen' : recipients.every((p) => m.deliveredTo?.includes(p)) ? 'delivered' : 'sent';
+};
+const messagePublic = (m) => ({ ...m, status: messageStatus(m) });
+const emitMessage = (m, event = 'message_updated') => emitTo(membersOf(m.roomId), event, messagePublic(m));
+const sessionUser = (token) => {
+  const session = db.sessions[hash(token || '')];
+  return session?.expires > Date.now() && db.accounts[session.phone] ? session.phone : null;
+};
+const requireAuth = (req, res, next) => {
+  req.user = sessionUser(req.headers.authorization?.replace(/^Bearer /, ''));
+  if (!req.user) return res.status(401).json({ error: 'Please sign in again' });
+  next();
+};
+const visibleStatuses = (me) => db.statuses.filter((s) => s.expiresAt > Date.now() && !blocked(me, s.from));
+const syncPrefs = (me) => { save(); emitTo([me], 'preferences', prefs(me)); };
+const syncGroups = () => { save(); for (const me of online.keys()) emitTo([me], 'groups', Object.values(db.groups).filter((g) => g.members.includes(me))); };
+const syncCalls = (people) => { save(); for (const p of new Set(people)) emitTo([p], 'calls', db.calls.filter((c) => c.from === p || c.to === p).slice(-100).reverse()); };
+const ackError = (ack, error) => ack?.({ ok: false, error });
+const safeUrl = (value) => { try { const u = new URL(value); return ['http:', 'https:'].includes(u.protocol) ? u.href : null; } catch { return null; } };
+const media = (f) => f && safeUrl(f.url) ? { url: safeUrl(f.url), name: trim(f.name || 'Attachment', 160), mime: trim(f.mime, 100), size: Math.max(0, Number(f.size) || 0), duration: Math.min(3600, Number(f.duration) || 0) } : null;
+
+app.get('/api/config', (_req, res) => res.json({ demoAuth, founderPhone: phoneValid(founderPhone) ? founderPhone : null }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, online: online.size }));
+app.get('/api/push/key', requireAuth, (_req, res) => res.json({ publicKey: vapid.publicKey }));
+app.post('/api/push/subscribe', requireAuth, (req, res) => {
+  const s = req.body;
+  let endpoint;
+  try { endpoint = new URL(s.endpoint); } catch { return res.status(400).json({ error: 'Invalid push subscription' }); }
+  // Restrict requests to known browser push services; never fetch arbitrary subscription URLs.
+  const host = endpoint.hostname;
+  if (endpoint.protocol !== 'https:' || endpoint.port || !['fcm.googleapis.com', 'updates.push.services.mozilla.com', 'web.push.apple.com', 'notify.windows.com'].some((d) => host === d || host.endsWith(`.${d}`)) || !/^[\w-]{80,100}$/.test(s.keys?.p256dh || '') || !/^[\w-]{20,30}$/.test(s.keys?.auth || '')) return res.status(400).json({ error: 'Unsupported push subscription' });
+  db.subscriptions[hash(s.endpoint)] = { phone: req.user, sessionKey: hash(req.headers.authorization.replace(/^Bearer /, '')), subscription: { endpoint: s.endpoint, keys: s.keys } };
+  save(); res.json({ ok: true });
+});
+const pushMessage = (m) => {
+  const recipients = membersOf(m.roomId).filter((p) => p !== m.from);
+  for (const [key, entry] of Object.entries(db.subscriptions)) {
+    const p = entry.phone, chat = m.to.startsWith('group:') ? m.to : m.from;
+    if ([...io.sockets.sockets.values()].some((socket) => socket.data.sessionKey === entry.sessionKey)) continue;
+    if (!recipients.includes(p) || prefs(p).muted.includes(chat) || !db.sessions[entry.sessionKey] || db.sessions[entry.sessionKey].expires <= Date.now()) continue;
+    const payload = { title: db.groups[m.roomId]?.name || m.fromName, body: m.text || (m.voice ? 'Voice message' : m.gif ? 'GIF' : m.file?.name || 'New message'), tag: `chat-${m.roomId}`, url: `/?chat=${encodeURIComponent(chat)}` };
+    webpush.sendNotification(entry.subscription, JSON.stringify(payload), { TTL: 86400, timeout: 10000 }).catch((e) => { if ([404, 410].includes(e.statusCode)) { delete db.subscriptions[key]; save(); } });
+  }
+};
+app.post('/api/send-otp', async (req, res) => {
+  const phone = trim(req.body?.phone);
+  if (!phoneValid(phone)) return res.status(400).json({ ok: false, error: 'Enter a 10-digit mobile number' });
+  const previous = otps.get(phone);
+  if (previous && previous.sentAt > Date.now() - 30000) return res.status(429).json({ ok: false, error: 'Wait 30 seconds before requesting another code' });
+  const code = demoAuth ? '111111' : String(randomInt(100000, 1000000));
+  otps.set(phone, { codeHash: hash(code), expires: Date.now() + 300000, sentAt: Date.now(), attempts: 0 });
+  if (!demoAuth) {
+    const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: token, TWILIO_FROM: from } = process.env;
+    if (!sid || !token || !from) { otps.delete(phone); return res.status(503).json({ ok: false, error: 'SMS delivery is not configured by the site owner' }); }
+    try {
+      const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
+        method: 'POST', headers: { Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ To: `${process.env.PHONE_COUNTRY_CODE || '+91'}${phone}`, From: from, Body: `Your PulseChat code is ${code}. Valid for 5 minutes.` }), signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) throw new Error('SMS delivery failed');
+    } catch { otps.delete(phone); return res.status(502).json({ ok: false, error: 'Could not send SMS. Try again.' }); }
+  }
+  res.json({ ok: true, demoAuth, hint: demoAuth ? 'Demo code: 111111' : undefined });
+});
+app.post('/api/verify-otp', (req, res) => {
+  const phone = trim(req.body?.phone), record = otps.get(phone);
+  if (!record || record.expires < Date.now()) return res.status(400).json({ ok: false, error: 'Request a new code' });
+  if (++record.attempts > 5) { otps.delete(phone); return res.status(429).json({ ok: false, error: 'Too many attempts. Request a new code.' }); }
+  if (hash(req.body?.otp) !== record.codeHash) return res.status(400).json({ ok: false, error: 'Incorrect code' });
+  otps.delete(phone);
+  db.accounts[phone] ||= { phone, name: `User ${phone.slice(-4)}`, about: 'Available', joinedAt: Date.now(), lastSeen: null };
+  const token = randomBytes(32).toString('hex');
+  db.sessions[hash(token)] = { phone, expires: Date.now() + 30 * 86400000, profilePending: true };
+  save(); res.json({ ok: true, token, user: db.accounts[phone] });
+});
+app.post('/api/logout', requireAuth, (req, res) => {
+  const key = hash(req.headers.authorization.replace(/^Bearer /, ''));
+  delete db.sessions[key];
+  for (const [id, s] of Object.entries(db.subscriptions)) if (s.sessionKey === key) delete db.subscriptions[id];
+  for (const socket of io.sockets.sockets.values()) if (socket.data.sessionKey === key) socket.disconnect(true);
+  save(); res.json({ ok: true });
+});
+cloudinary.config({ cloud_name: process.env.CLOUDINARY_CLOUD_NAME, api_key: process.env.CLOUDINARY_API_KEY, api_secret: process.env.CLOUDINARY_API_SECRET });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => {
+  try {
+    const f = req.file;
+    if (!f) return res.status(400).json({ error: 'No file selected' });
+    let url;
+    if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+      const result = await cloudinary.uploader.upload(`data:${f.mimetype};base64,${f.buffer.toString('base64')}`, { folder: 'pulsechat', resource_type: 'auto' });
+      url = result.secure_url;
+    } else {
+      const id = randomUUID();
+      fs.writeFileSync(path.join(uploadsDir, id), f.buffer);
+      fs.writeFileSync(path.join(uploadsDir, `${id}.json`), JSON.stringify({ name: f.originalname, mime: f.mimetype }));
+      url = `${process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`}/api/files/${id}`;
+    }
+    res.json({ url, name: f.originalname, size: f.size, mime: f.mimetype });
+  } catch { res.status(500).json({ error: 'Upload failed. Check media storage configuration.' }); }
+});
+app.get('/api/files/:id', (req, res) => {
+  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) return res.sendStatus(404);
+  const file = path.join(uploadsDir, req.params.id);
+  if (!fs.existsSync(file)) return res.sendStatus(404);
+  const meta = JSON.parse(fs.readFileSync(`${file}.json`, 'utf8'));
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Content-Security-Policy', "default-src 'none'; sandbox");
+  const mime = meta.mime.split(';')[0];
+  const inline = /^(image\/(png|jpeg|gif|webp|avif)|video\/(mp4|webm|ogg)|audio\/(webm|ogg|mpeg|mp4|wav))$/.test(mime);
+  res.type(inline ? mime : 'application/octet-stream');
+  res.set('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(meta.name)}`);
+  res.sendFile(file);
+});
+app.use((err, _req, res, _next) => res.status(err instanceof multer.MulterError ? 400 : 500).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Maximum file size is 25 MB' : 'Request failed' }));
+const purgeExpired = () => {
+  let changed = false;
+  for (const [rid, list] of Object.entries(db.history)) {
+    const remaining = list.filter((m) => !m.expiresAt || m.expiresAt > Date.now());
+    if (remaining.length !== list.length) { db.history[rid] = remaining; changed = true; emitTo(membersOf(rid), 'messages_expired', { roomId: rid, ids: list.filter((m) => m.expiresAt && m.expiresAt <= Date.now()).map((m) => m.id) }); }
+  }
+  const statuses = db.statuses.filter((s) => s.expiresAt > Date.now());
+  if (statuses.length !== db.statuses.length) { db.statuses = statuses; changed = true; for (const p of online.keys()) emitTo([p], 'statuses', visibleStatuses(p)); }
+  for (const [key, s] of Object.entries(db.sessions)) if (s.expires <= Date.now()) { delete db.sessions[key]; changed = true; }
+  for (const [p, o] of otps) if (o.expires <= Date.now()) otps.delete(p);
+  if (changed) save();
+};
+purgeExpired();
+setInterval(purgeExpired, 30000).unref();
+for (const c of db.calls) if (['ringing', 'connected'].includes(c.status)) { c.status = 'interrupted'; c.endedAt = Date.now(); }
+save();
+const finishCall = (c, status, event = 'call_ended') => {
+  clearTimeout(c.timer); activeCalls.delete(c.callId);
+  const log = db.calls.find((x) => x.callId === c.callId);
+  if (log) { log.status = status; log.endedAt = Date.now(); log.duration = log.answeredAt ? Math.floor((log.endedAt - log.answeredAt) / 1000) : 0; }
+  emitTo([c.from, c.to], event, { callId: c.callId, reason: status }); syncCalls([c.from, c.to]);
+};
+io.on('connection', (socket) => {
+  let me = null;
+  const on = (event, handler) => socket.on(event, (payload = {}, ack) => {
+    if (typeof ack !== 'function') ack = undefined;
+    if (!me || !sessionUser(socket.handshake.auth?.token)) return ackError(ack, 'Please sign in again');
+    try { handler(payload || {}, ack); } catch (error) { console.error(`Socket ${event}:`, error.message); ackError(ack, 'Could not complete the action'); }
+  });
+  socket.on('register', (payload, ack) => {
+    if (typeof ack !== 'function') ack = undefined;
+    const { token, name } = payload || {};
+    const p = sessionUser(token);
+    if (!p) return ackError(ack, 'Session expired. Sign in with your code again.');
+    if (me) return ackError(ack, 'Already signed in');
+    me = p; socket.handshake.auth = { token }; socket.data.sessionKey = hash(token);
+    const authSession = db.sessions[hash(token)];
+    if (authSession.profilePending && trim(name, 30)) { db.accounts[p].name = trim(name, 30); authSession.profilePending = false; }
+    if (!online.has(p)) online.set(p, new Set());
+    online.get(p).add(socket.id); socket.join(`user:${p}`);
+    const conversations = {};
+    for (const [rid, messages] of Object.entries(db.history)) {
+      if (!canRead(me, rid)) continue;
+      for (const m of messages) if (m.from !== me && !m.deliveredTo?.includes(me)) { (m.deliveredTo ||= []).push(me); emitMessage(m); }
+      conversations[rid] = messages.filter((m) => !m.deletedFor?.includes(me)).map(messagePublic);
+    }
+    save();
+    ack?.({ ok: true, user: db.accounts[me], users: usersPublic(), preferences: prefs(me), groups: Object.values(db.groups).filter((g) => g.members.includes(me)), conversations, statuses: visibleStatuses(me), calls: db.calls.filter((c) => c.from === me || c.to === me).slice(-100).reverse(), founderPhone: phoneValid(founderPhone) ? founderPhone : null });
+    broadcastUsers();
+  });
+  on('get_history', ({ with: other }, ack) => {
+    const rid = roomId(me, String(other || ''));
+    if (!canRead(me, rid)) return ackError(ack, 'You cannot access this chat');
+    ack?.({ ok: true, roomId: rid, messages: (db.history[rid] || []).filter((m) => !m.deletedFor?.includes(me)).map(messagePublic) });
+  });
+  on('send_message', (payload, ack) => {
+    const to = trim(payload.to, 80), rid = roomId(me, to);
+    if (!canRead(me, rid) || (!to.startsWith('group:') && !db.accounts[to])) return ackError(ack, 'Contact or group is unavailable');
+    if (!to.startsWith('group:') && blocked(me, to)) return ackError(ack, 'Messages cannot be sent to this contact');
+    const text = trim(payload.text), file = media(payload.file), voice = media(payload.voice), gif = media(payload.gif);
+    if (!text && !file && !voice && !gif) return ackError(ack, 'Write a message or attach a file');
+    const list = db.history[rid] ||= [], clientId = trim(payload.clientId, 100);
+    const existing = clientId && list.find((m) => m.from === me && m.clientId === clientId);
+    if (existing) return ack?.({ ok: true, message: messagePublic(existing) });
+    const members = [...new Set(membersOf(rid))];
+    const reply = list.find((m) => m.id === payload.replyTo?.id && !m.deleted && !m.deletedFor?.includes(me));
+    const lifetime = db.groups[rid]?.disappearing || prefs(me).disappearing?.[to] || 0;
+    const message = { id: randomUUID(), clientId, roomId: rid, from: me, fromName: db.accounts[me].name, to, text, file, voice, gif,
+      replyTo: reply ? { id: reply.id, fromName: reply.fromName, preview: reply.text || 'Attachment' } : null,
+      forwarded: !!payload.forwarded, time: new Date().toISOString(), reactions: {}, deletedFor: [], members,
+      deliveredTo: members.filter(isOnline), readBy: [me], expiresAt: lifetime ? Date.now() + lifetime : null };
+    list.push(message);
+    for (const p of members) prefs(p).hidden = prefs(p).hidden.filter((x) => x !== (to.startsWith('group:') ? to : p === me ? to : me));
+    save(); emitMessage(message, 'message'); pushMessage(message); ack?.({ ok: true, message: messagePublic(message) });
+  });
+  const getMessage = (rid, id) => canRead(me, rid || '') ? db.history[rid]?.find((m) => m.id === id && !m.deletedFor?.includes(me)) : null;
+  on('edit_message', ({ roomId: rid, messageId, text }, ack) => {
+    const m = getMessage(rid, messageId);
+    if (!m || m.from !== me || m.deleted || !trim(text)) return ackError(ack, 'This message cannot be edited');
+    m.text = trim(text); m.editedAt = new Date().toISOString(); save(); emitMessage(m); ack?.({ ok: true });
+  });
+  on('delete_message', ({ roomId: rid, messageId, forEveryone }, ack) => {
+    const m = getMessage(rid, messageId);
+    if (!m) return ackError(ack, 'Message is unavailable');
+    if (forEveryone) {
+      if (m.from !== me) return ackError(ack, 'Only the sender can delete for everyone');
+      Object.assign(m, { deleted: true, text: '', file: null, gif: null, voice: null, replyTo: null, reactions: {} }); emitMessage(m);
+    } else { (m.deletedFor ||= []).push(me); emitTo([me], 'message_updated', messagePublic(m)); }
+    save(); ack?.({ ok: true });
+  });
+  on('react_message', ({ roomId: rid, messageId, emoji }, ack) => {
+    const m = getMessage(rid, messageId);
+    if (!m || m.deleted || !['❤️', '👍', '😂', '😮', '😢', '🙏'].includes(emoji)) return ackError(ack, 'Reaction is unavailable');
+    const previous = m.reactions[emoji]?.includes(me);
+    for (const [key, people] of Object.entries(m.reactions)) { m.reactions[key] = people.filter((p) => p !== me); if (!m.reactions[key].length) delete m.reactions[key]; }
+    if (!previous) (m.reactions[emoji] ||= []).push(me);
+    save(); emitMessage(m); ack?.({ ok: true });
+  });
+  on('seen', ({ roomId: rid, ids }, ack) => {
+    if (!canRead(me, rid || '') || !Array.isArray(ids)) return ackError(ack, 'Invalid read receipt');
+    const wanted = new Set(ids.slice(0, 5000));
+    for (const m of db.history[rid] || []) if (wanted.has(m.id) && m.from !== me && !m.readBy?.includes(me) && !m.deletedFor?.includes(me)) {
+      (m.readBy ||= []).push(me); if (!m.deliveredTo.includes(me)) m.deliveredTo.push(me); emitMessage(m);
+    }
+    save(); ack?.({ ok: true });
+  });
+  on('typing', ({ to, isTyping }) => {
+    const rid = roomId(me, String(to || ''));
+    if (!canRead(me, rid) || (!to?.startsWith('group:') && blocked(me, to))) return;
+    emitTo(membersOf(rid).filter((p) => p !== me), 'typing', { from: me, fromName: db.accounts[me].name, roomId: rid, isTyping: !!isTyping });
+  });
+  on('preferences', ({ key, value, enabled }, ack) => {
+    if (!['muted', 'favorites', 'pinned', 'archived', 'blocked', 'starred', 'hidden'].includes(key) || typeof value !== 'string') return ackError(ack, 'Invalid setting');
+    const list = prefs(me)[key]; prefs(me)[key] = enabled ? [...new Set([...list, value])] : list.filter((v) => v !== value);
+    if (key === 'blocked') { emitTo([me], 'statuses', visibleStatuses(me)); if (db.accounts[value]) emitTo([value], 'statuses', visibleStatuses(value)); }
+    syncPrefs(me); ack?.({ ok: true });
+  });
+  on('clear_chat', ({ with: to, hide }, ack) => {
+    const rid = roomId(me, String(to || ''));
+    if (!canRead(me, rid)) return ackError(ack, 'Chat is unavailable');
+    for (const m of db.history[rid] || []) if (!m.deletedFor.includes(me)) m.deletedFor.push(me);
+    if (hide && !prefs(me).hidden.includes(to)) prefs(me).hidden.push(to);
+    syncPrefs(me); emitTo([me], 'chat_cleared', { roomId: rid }); ack?.({ ok: true });
+  });
+  on('profile', ({ name, about }, ack) => {
+    if (trim(name, 30).length < 2) return ackError(ack, 'Name must contain at least 2 characters');
+    Object.assign(db.accounts[me], { name: trim(name, 30), about: trim(about, 140) }); save(); broadcastUsers();
+    emitTo([me], 'profile', db.accounts[me]); ack?.({ ok: true });
+  });
+  on('create_group', ({ name, description, members }, ack) => {
+    const people = [...new Set([me, ...(Array.isArray(members) ? members : [])])];
+    if (trim(name, 60).length < 2 || people.length < 2 || people.length > 100 || people.some((p) => !db.accounts[p] || (p !== me && blocked(me, p)))) return ackError(ack, 'Choose a group name and 1–99 available members');
+    const id = `group:${randomUUID()}`;
+    const group = { id, phone: id, isGroup: true, name: trim(name, 60), description: trim(description, 240), members: people, admins: [me], createdBy: me, joinedAt: Date.now(), disappearing: 0 };
+    db.groups[id] = group; syncGroups(); ack?.({ ok: true, group });
+  });
+  on('update_group', ({ id, action, phone, name, description }, ack) => {
+    const g = db.groups[id];
+    if (!g?.members.includes(me)) return ackError(ack, 'You are not a member');
+    if (action !== 'leave' && !g.admins.includes(me)) return ackError(ack, 'Only group admins can make this change');
+    if (action === 'details') { if (trim(name, 60).length < 2) return ackError(ack, 'Enter a group name'); g.name = trim(name, 60); g.description = trim(description, 240); }
+    else if (action === 'add') { if (!db.accounts[phone] || blocked(me, phone) || g.members.length >= 100) return ackError(ack, 'Member cannot be added'); g.members = [...new Set([...g.members, phone])]; }
+    else if (action === 'admin') { if (!g.members.includes(phone)) return ackError(ack, 'Member is unavailable'); g.admins = [...new Set([...g.admins, phone])]; }
+    else if (action === 'remove' || action === 'leave') {
+      const target = action === 'leave' ? me : phone;
+      if (!g.members.includes(target)) return ackError(ack, 'Member is unavailable');
+      g.members = g.members.filter((p) => p !== target); g.admins = g.admins.filter((p) => p !== target);
+      if (g.members.length && !g.admins.length) g.admins = [g.members[0]];
+      if (!g.members.length) { delete db.groups[id]; delete db.history[id]; }
+    } else return ackError(ack, 'Unknown group action');
+    syncGroups(); ack?.({ ok: true });
+  });
+  on('disappearing', ({ to, duration }, ack) => {
+    if (![0, 86400000, 604800000, 7776000000].includes(duration)) return ackError(ack, 'Choose a valid timer');
+    const rid = roomId(me, String(to || ''));
+    if (!canRead(me, rid)) return ackError(ack, 'Chat is unavailable');
+    if (to.startsWith('group:')) { if (!db.groups[to].admins.includes(me)) return ackError(ack, 'Only admins can change the timer'); db.groups[to].disappearing = duration; syncGroups(); }
+    else { (prefs(me).disappearing ||= {})[to] = duration; syncPrefs(me); }
+    ack?.({ ok: true });
+  });
+  on('post_status', ({ text, color }, ack) => {
+    if (!trim(text, 700)) return ackError(ack, 'Write a status update');
+    if (db.statuses.filter((s) => s.from === me).length >= 20) return ackError(ack, 'Maximum 20 active updates');
+    db.statuses.push({ id: randomUUID(), from: me, fromName: db.accounts[me].name, text: trim(text, 700), color: ['#047857', '#4338ca', '#9d174d', '#92400e'].includes(color) ? color : '#047857', time: Date.now(), expiresAt: Date.now() + 86400000, viewedBy: [] });
+    save(); for (const p of online.keys()) emitTo([p], 'statuses', visibleStatuses(p)); ack?.({ ok: true });
+  });
+  on('delete_status', ({ id }, ack) => {
+    if (!db.statuses.some((s) => s.id === id && s.from === me)) return ackError(ack, 'You can delete your own updates');
+    db.statuses = db.statuses.filter((s) => s.id !== id); save(); for (const p of online.keys()) emitTo([p], 'statuses', visibleStatuses(p)); ack?.({ ok: true });
+  });
+  on('view_status', ({ id }) => {
+    const s = visibleStatuses(me).find((s) => s.id === id);
+    if (s && s.from !== me && !s.viewedBy.includes(me)) { s.viewedBy.push(me); save(); emitTo([s.from], 'statuses', visibleStatuses(s.from)); }
+  });
+  on('call_user', ({ to, type, offer, callId }, ack) => {
+    if (!db.accounts[to] || to === me || !['audio', 'video'].includes(type) || !offer?.sdp || typeof callId !== 'string' || callId.length > 100 || blocked(me, to)) return ackError(ack, 'Cannot call this contact');
+    if ([...activeCalls.values()].some((c) => [c.from, c.to].some((p) => p === me || p === to))) return ackError(ack, 'This contact is already on a call');
+    const log = { callId, from: me, to, type, time: Date.now(), status: isOnline(to) ? 'ringing' : 'missed' };
+    db.calls.push(log); syncCalls([me, to]);
+    if (!isOnline(to)) return ackError(ack, 'Contact is offline');
+    const c = { callId, from: me, to, timer: setTimeout(() => finishCall(c, 'missed'), 45000) };
+    activeCalls.set(callId, c);
+    emitTo([to], 'incoming_call', { from: me, fromName: db.accounts[me].name, type, offer, callId }); ack?.({ ok: true });
+  });
+  for (const event of ['call_answer', 'call_ice', 'call_reject', 'call_end']) on(event, (payload, ack) => {
+    const c = activeCalls.get(payload.callId);
+    if (!c || ![c.from, c.to].includes(me)) return ackError(ack, 'Call is no longer active');
+    const other = c.from === me ? c.to : c.from;
+    if (event === 'call_answer') {
+      const log = db.calls.find((x) => x.callId === c.callId);
+      if (me !== c.to || log.status !== 'ringing' || !payload.answer?.sdp) return ackError(ack, 'Call is already answered');
+      clearTimeout(c.timer); log.status = 'connected'; log.answeredAt = Date.now(); syncCalls([me, other]);
+      emitTo([other], event, { from: me, answer: payload.answer, callId: c.callId });
+      socket.to(`user:${me}`).emit('call_ended', { callId: c.callId, reason: 'answered_elsewhere' });
+    } else if (event === 'call_ice') emitTo([other], event, { from: me, candidate: payload.candidate, callId: c.callId });
+    else finishCall(c, event === 'call_reject' ? 'declined' : db.calls.find((x) => x.callId === c.callId)?.answeredAt ? 'completed' : 'cancelled', event === 'call_reject' ? 'call_rejected' : 'call_ended');
+    ack?.({ ok: true });
+  });
+  socket.on('disconnect', () => {
+    if (!me) return;
+    online.get(me)?.delete(socket.id);
+    if (!online.get(me)?.size) {
+      online.delete(me); db.accounts[me].lastSeen = Date.now();
+      for (const c of activeCalls.values()) if ([c.from, c.to].includes(me)) finishCall(c, 'interrupted');
+      save(); broadcastUsers();
+    }
+  });
+});
+server.listen(process.env.PORT || 5000, () => console.log(`PulseChat listening on ${process.env.PORT || 5000} (${demoAuth ? 'demo login' : 'SMS login'})`));
