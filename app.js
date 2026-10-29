@@ -68,6 +68,7 @@ const prefs = (p) =>
 const online = new Map(),
   otps = new Map(),
   activeCalls = new Map(),
+  groupCalls = new Map(),
   pendingDeviceLinks = new Map();
 const isOnline = (p) => !!online.get(p)?.size;
 const authMode = process.env.AUTH_MODE || (process.env.NODE_ENV === 'production' ? 'sms' : 'demo');
@@ -175,7 +176,7 @@ const syncCalls = (people) => {
       [p],
       'calls',
       db.calls
-        .filter((c) => c.from === p || c.to === p)
+        .filter((c) => c.from === p || c.to === p || c.members?.includes(p))
         .slice(-100)
         .reverse()
     );
@@ -265,6 +266,7 @@ const pushMessage = (m) => {
       continue;
     const payload = {
       title: db.groups[m.roomId]?.name || m.fromName,
+      icon: db.accounts[m.from]?.avatarUrl || '/icon-192.png',
       body:
         m.text ||
         m.task?.title ||
@@ -298,9 +300,10 @@ const pushIncomingCall = (c) => {
     webpush.sendNotification(entry.subscription, JSON.stringify({
       type: 'call',
       title: db.accounts[c.from]?.name || 'Incoming call',
+      icon: db.accounts[c.from]?.avatarUrl || '/icon-192.png',
       body: `Incoming ${c.type === 'video' ? 'video' : 'voice'} call · Tap to open PulseChat`,
       tag: `call-${c.callId}`,
-      url: `/?chat=${encodeURIComponent(c.from)}&call=${encodeURIComponent(c.callId)}`,
+      url: `/?chat=${encodeURIComponent(c.groupId || c.from)}&call=${encodeURIComponent(c.callId)}`,
     }), { TTL: 45, urgency: 'high', timeout: 10000 }).catch((e) => {
       if ([404, 410].includes(e.statusCode)) { delete db.subscriptions[key]; save(); }
     });
@@ -627,7 +630,7 @@ app.get('/api/files/:id', (req, res) => {
   res.type(inline ? mime : 'application/octet-stream');
   res.set(
     'Content-Disposition',
-    `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(meta.name)}`
+    `${req.query.download === '1' ? 'attachment' : inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(meta.name)}`
   );
   res.sendFile(file);
 });
@@ -678,6 +681,28 @@ for (const c of db.calls)
     c.endedAt = Date.now();
   }
 save();
+// Limited-size peer-mesh group calls. Membership is always checked at signaling time.
+// This is intentionally capped: larger calls need a deployed SFU instead of mesh.
+const GROUP_CALL_LIMIT = 4;
+const closeGroupCall = (call) => {
+  if (!call) return;
+  groupCalls.delete(call.callId);
+  const log = db.calls.find(c => c.callId === call.callId);
+  if (log) {
+    log.status = log.answeredAt ? 'completed' : 'cancelled';
+    log.endedAt = Date.now();
+    log.duration = log.answeredAt ? Math.floor((log.endedAt - log.answeredAt) / 1000) : 0;
+    syncCalls(log.members || []);
+  }
+  emitTo(db.groups[call.groupId]?.members || [], 'group_call_ended', { callId: call.callId, groupId: call.groupId });
+};
+const leaveGroupCall = (call, phone) => {
+  if (!call?.participants.has(phone)) return;
+  call.participants.delete(phone);
+  call.sockets.delete(phone);
+  emitTo([...call.participants], 'group_call_peer_left', { callId: call.callId, phone });
+  if (!call.participants.size) closeGroupCall(call);
+};
 const finishCall = (c, status, event = 'call_ended') => {
   clearTimeout(c.timer);
   activeCalls.delete(c.callId);
@@ -753,7 +778,9 @@ const deliverMessage = (me, payload) => {
     deletedFor: [],
     members,
     deliveredTo: members.filter(isOnline),
+    deliveredAt: Object.fromEntries(members.filter(isOnline).map(p => [p, Date.now()])),
     readBy: [me],
+    readAt: { [me]: Date.now() },
     expiresAt: lifetime ? Date.now() + lifetime : null,
   };
   list.push(message);
@@ -806,6 +833,7 @@ io.on('connection', (socket) => {
       for (const m of messages)
         if (m.from !== me && !m.deliveredTo?.includes(me)) {
           (m.deliveredTo ||= []).push(me);
+          (m.deliveredAt ||= {})[me] = Date.now();
           emitMessage(m);
         }
       conversations[rid] = messages.filter((m) => !m.deletedFor?.includes(me)).map(messagePublic);
@@ -827,12 +855,20 @@ io.on('connection', (socket) => {
       conversations,
       statuses: visibleStatuses(me),
       calls: db.calls
-        .filter((c) => c.from === me || c.to === me)
+        .filter((c) => c.from === me || c.to === me || c.members?.includes(me))
         .slice(-100)
         .reverse(),
       founderPhone: phoneValid(founderPhone) ? founderPhone : null,
     });
     broadcastUsers();
+    for (const groupCall of groupCalls.values()) {
+      const group = db.groups[groupCall.groupId];
+      if (group?.members.includes(me) && !groupCall.participants.has(me))
+        socket.emit('group_call_invite', { callId: groupCall.callId,
+          groupId: groupCall.groupId, groupName: group.name,
+          from: groupCall.from, fromName: db.accounts[groupCall.from]?.name || 'Member',
+          type: groupCall.type });
+    }
     // When a PWA is opened from a call notification, redeliver the pending offer.
     for (const call of activeCalls.values()) {
       if (call.to === me && !call.answeredAt) socket.emit('incoming_call', {
@@ -905,7 +941,10 @@ io.on('connection', (socket) => {
   });
   on('react_message', ({ roomId: rid, messageId, emoji }, ack) => {
     const m = getMessage(rid, messageId);
-    if (!m || m.deleted || !['❤️', '👍', '😂', '😮', '😢', '🙏'].includes(emoji))
+    const validEmoji = typeof emoji === 'string' && emoji.length <= 32 &&
+      [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment(emoji)].length === 1 &&
+      /[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Presentation}]/u.test(emoji);
+    if (!m || m.deleted || !validEmoji)
       return ackError(ack, 'Reaction is unavailable');
     const previous = m.reactions[emoji]?.includes(me);
     for (const [key, people] of Object.entries(m.reactions)) {
@@ -929,7 +968,11 @@ io.on('connection', (socket) => {
         !m.deletedFor?.includes(me)
       ) {
         (m.readBy ||= []).push(me);
-        if (!m.deliveredTo.includes(me)) m.deliveredTo.push(me);
+        (m.readAt ||= {})[me] = Date.now();
+        if (!m.deliveredTo.includes(me)) {
+          m.deliveredTo.push(me);
+          (m.deliveredAt ||= {})[me] = Date.now();
+        }
         emitMessage(m);
       }
     save();
@@ -1053,6 +1096,10 @@ io.on('connection', (socket) => {
       const target = action === 'leave' ? me : phone;
       if (!g.members.includes(target)) return ackError(ack, 'Member is unavailable');
       g.members = g.members.filter((p) => p !== target);
+      for (const active of [...groupCalls.values()]) if (active.groupId === id && active.participants.has(target)) {
+        emitTo([target], 'group_call_ended', { callId: active.callId, groupId: id });
+        leaveGroupCall(active, target);
+      }
       g.admins = g.admins.filter((p) => p !== target);
       if (g.members.length && !g.admins.length) g.admins = [g.members[0]];
       if (!g.members.length) {
@@ -1120,6 +1167,65 @@ io.on('connection', (socket) => {
       emitTo([s.from], 'statuses', visibleStatuses(s.from));
     }
   });
+  on('group_call_start', ({ groupId, type }, ack) => {
+    const group = db.groups[groupId];
+    if (!group?.members.includes(me) || !['audio', 'video'].includes(type))
+      return ackError(ack, 'Group call is unavailable');
+    if ([...activeCalls.values()].some(c => c.from === me || c.to === me) ||
+        [...groupCalls.values()].some(c => c.participants.has(me)))
+      return ackError(ack, 'End your other call first');
+    if ([...groupCalls.values()].some(c => c.groupId === groupId))
+      return ackError(ack, 'This group already has a call. Join its invitation.');
+    const call = { callId: randomUUID(), groupId, type, from: me,
+      createdAt: Date.now(), participants: new Set([me]), sockets: new Map([[me, socket.id]]) };
+    db.calls.push({ callId: call.callId, from: me, to: groupId, type, time: Date.now(),
+      status: 'ringing', group: true, members: [...group.members] });
+    syncCalls(group.members);
+    groupCalls.set(call.callId, call);
+    const invitees = group.members.filter(p => p !== me && !blocked(me, p));
+    emitTo(invitees, 'group_call_invite', { callId: call.callId, groupId, groupName: group.name,
+      from: me, fromName: db.accounts[me].name, type });
+    for (const to of invitees) pushIncomingCall({ callId: call.callId, from: me, to, type, groupId });
+    ack?.({ ok: true, callId: call.callId, groupId, type, participants: [] });
+  });
+  on('group_call_join', ({ callId }, ack) => {
+    const call = groupCalls.get(callId), group = db.groups[call?.groupId];
+    if (!call || !group?.members.includes(me) || blocked(me, call.from))
+      return ackError(ack, 'Call has ended or you are not a member');
+    if (call.participants.has(me)) return ackError(ack, 'Already in call');
+    if (call.participants.size >= GROUP_CALL_LIMIT) return ackError(ack, 'Group calls support up to 4 participants');
+    if ([...activeCalls.values()].some(c => c.from === me || c.to === me) ||
+        [...groupCalls.values()].some(c => c.participants.has(me)))
+      return ackError(ack, 'End your other call first');
+    const participants = [...call.participants];
+    call.participants.add(me);
+    call.sockets.set(me, socket.id);
+    const log = db.calls.find(c => c.callId === callId);
+    if (log && !log.answeredAt) { log.answeredAt = Date.now(); log.status = 'connected'; syncCalls(group.members); }
+    emitTo(participants, 'group_call_member_joined', { callId, phone: me, name: db.accounts[me].name });
+    ack?.({ ok: true, groupId: call.groupId, type: call.type, participants,
+      groupName: group.name });
+  });
+  on('group_call_signal', ({ callId, to, description, candidate }, ack) => {
+    const call = groupCalls.get(callId);
+    if (!call || call.sockets.get(me) !== socket.id || !call.participants.has(me) || !call.participants.has(to) || me === to ||
+        !db.groups[call.groupId]?.members.includes(me) ||
+        !db.groups[call.groupId]?.members.includes(to))
+      return ackError(ack, 'Not a participant');
+    const validDescription = description && ['offer','answer'].includes(description.type) &&
+      typeof description.sdp === 'string' && description.sdp.length < 100000;
+    const validIce = candidate && typeof candidate.candidate === 'string' && candidate.candidate.length < 4096;
+    if (!validDescription && !validIce) return ackError(ack, 'Invalid signaling data');
+    emitTo([to], 'group_call_signal', { callId, from: me,
+      description: validDescription ? description : undefined,
+      candidate: validIce ? candidate : undefined });
+    ack?.({ ok: true });
+  });
+  on('group_call_leave', ({ callId }, ack) => {
+    const active = groupCalls.get(callId);
+    if (active?.sockets.get(me) === socket.id) leaveGroupCall(active, me);
+    ack?.({ ok: true });
+  });
   on('call_user', ({ to, type, offer, callId }, ack) => {
     if (
       !db.accounts[to] ||
@@ -1131,7 +1237,8 @@ io.on('connection', (socket) => {
       blocked(me, to)
     )
       return ackError(ack, 'Cannot call this contact');
-    if ([...activeCalls.values()].some((c) => [c.from, c.to].some((p) => p === me || p === to)))
+    if ([...groupCalls.values()].some(c => c.participants.has(me) || c.participants.has(to)) ||
+        [...activeCalls.values()].some((c) => [c.from, c.to].some((p) => p === me || p === to)))
       return ackError(ack, 'This contact is already on a call');
     const log = {
       callId,
@@ -1212,6 +1319,8 @@ io.on('connection', (socket) => {
   });
   socket.on('disconnect', () => {
     if (!me) return;
+    for (const groupCall of [...groupCalls.values()])
+      if (groupCall.sockets.get(me) === socket.id) leaveGroupCall(groupCall, me);
     online.get(me)?.delete(socket.id);
     if (!online.get(me)?.size) {
       online.delete(me);

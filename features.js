@@ -160,7 +160,11 @@ export function installFeatures({
       for (const m of list)
         if (m.from !== me && !m.readBy.includes(me) && !m.deletedFor.includes(me)) {
           m.readBy.push(me);
-          if (!m.deliveredTo.includes(me)) m.deliveredTo.push(me);
+          (m.readAt ||= {})[me] = Date.now();
+          if (!m.deliveredTo.includes(me)) {
+            m.deliveredTo.push(me);
+            (m.deliveredAt ||= {})[me] = Date.now();
+          }
           emitMessage(m);
         }
     }
