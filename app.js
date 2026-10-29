@@ -65,9 +65,12 @@ const prefs = (p) =>
   });
 const online = new Map(),
   otps = new Map(),
-  activeCalls = new Map();
+  activeCalls = new Map(),
+  pendingDeviceLinks = new Map();
 const isOnline = (p) => !!online.get(p)?.size;
-const demoAuth = (process.env.AUTH_MODE || 'demo') === 'demo';
+const demoAuth = (process.env.AUTH_MODE || (process.env.NODE_ENV === 'production' ? 'sms' : 'demo')) === 'demo';
+if (process.env.NODE_ENV === 'production' && demoAuth)
+  throw new Error('AUTH_MODE=demo is not allowed in production. Configure SMS OTP.');
 const founderPhone = trim(process.env.FOUNDER_PHONE, 10);
 if (phoneValid(founderPhone) && !db.accounts[founderPhone]) {
   db.accounts[founderPhone] = {
@@ -102,10 +105,14 @@ const io = new Server(server, {
 const emitTo = (people, event, data) =>
   io.to([...new Set(people)].map((p) => `user:${p}`)).emit(event, data);
 const usersPublic = () =>
-  Object.values(db.accounts).map(({ phone, name, about, joinedAt, lastSeen }) => ({
+  Object.values(db.accounts).map(({ phone, name, about, avatarUrl, avatarColor, avatarStyle, avatarFocus, joinedAt, lastSeen }) => ({
     phone,
     name,
     about,
+    avatarUrl,
+    avatarColor,
+    avatarStyle,
+    avatarFocus,
     joinedAt,
     lastSeen,
     online: isOnline(phone),
@@ -233,10 +240,12 @@ const pushMessage = (m) => {
   for (const [key, entry] of Object.entries(db.subscriptions)) {
     const p = entry.phone,
       chat = m.to.startsWith('group:') ? m.to : m.from;
-    if (
-      [...io.sockets.sockets.values()].some((socket) => socket.data.sessionKey === entry.sessionKey)
-    )
-      continue;
+    // A connected but backgrounded tab must still receive Web Push.
+    if ([...io.sockets.sockets.values()].some((socket) =>
+      socket.data.sessionKey === entry.sessionKey &&
+      socket.data.foreground === true &&
+      Date.now() - (socket.data.lastForeground || 0) < 60000
+    )) continue;
     if (
       !recipients.includes(p) ||
       prefs(p).focusUntil > Date.now() ||
@@ -267,6 +276,88 @@ const pushMessage = (m) => {
       });
   }
 };
+// Calls can ring through Web Push even when the recipient has no open tab.
+// Push can wake the installed PWA, but browsers cannot answer WebRTC in the background.
+const pushIncomingCall = (c) => {
+  for (const [key, entry] of Object.entries(db.subscriptions)) {
+    if (entry.phone !== c.to || !db.sessions[entry.sessionKey] ||
+        db.sessions[entry.sessionKey].expires <= Date.now()) continue;
+    const visible = [...io.sockets.sockets.values()].some((socket) =>
+      socket.data.sessionKey === entry.sessionKey && socket.data.foreground === true &&
+      Date.now() - (socket.data.lastForeground || 0) < 60000);
+    if (visible) continue;
+    webpush.sendNotification(entry.subscription, JSON.stringify({
+      type: 'call',
+      title: db.accounts[c.from]?.name || 'Incoming call',
+      body: `Incoming ${c.type === 'video' ? 'video' : 'voice'} call · Tap to open PulseChat`,
+      tag: `call-${c.callId}`,
+      url: `/?chat=${encodeURIComponent(c.from)}&call=${encodeURIComponent(c.callId)}`,
+    }), { TTL: 45, urgency: 'high', timeout: 10000 }).catch((e) => {
+      if ([404, 410].includes(e.statusCode)) { delete db.subscriptions[key]; save(); }
+    });
+  }
+};
+// One-time device link. An already authenticated device must explicitly approve the code.
+// The polling secret is separate from the human-readable code; neither is a login token.
+const deviceLinkTtlMs = 5 * 60 * 1000;
+const deviceLinkLimits = new Map();
+const deviceLinkRateLimit = (key, max = 10, windowMs = 60000) => {
+  const now = Date.now();
+  const previous = deviceLinkLimits.get(key);
+  const record = previous && previous.until > now ? previous : { count: 0, until: now + windowMs };
+  record.count++;
+  deviceLinkLimits.set(key, record);
+  return record.count <= max;
+};
+const newSession = (phone) => {
+  const token = randomBytes(32).toString('hex');
+  db.sessions[hash(token)] = { phone, expires: Date.now() + 30 * 86400000, profilePending: false };
+  save();
+  return token;
+};
+app.post('/api/device-link/start', (req, res) => {
+  if (!deviceLinkRateLimit(`start:${req.ip}`, 8, 60000))
+    return res.status(429).json({ error: 'Too many requests. Try again shortly.' });
+  const code = String(randomInt(10000000, 100000000));
+  const secret = randomBytes(32).toString('hex');
+  const requestId = randomUUID();
+  pendingDeviceLinks.set(requestId, { codeHash: hash(code), secretHash: hash(secret), created: Date.now(), expires: Date.now() + deviceLinkTtlMs, status: 'pending', phone: null, attempts: 0 });
+  res.json({ ok: true, requestId, secret, code, expiresIn: deviceLinkTtlMs / 1000 });
+});
+app.post('/api/device-link/approve', requireAuth, (req, res) => {
+  if (!deviceLinkRateLimit(`approve:${req.user}`, 8, 60000))
+    return res.status(429).json({ error: 'Too many attempts. Please retry in a minute.' });
+  const code = trim(req.body?.code, 8);
+  if (!/^\d{8}$/.test(code)) return res.status(400).json({ error: 'Enter the 8-digit pairing code.' });
+  const candidate = [...pendingDeviceLinks.values()].find((item) => item.codeHash === hash(code) && item.expires > Date.now() && item.status === 'pending');
+  if (!candidate) return res.status(404).json({ error: 'Code was not found or has expired.' });
+  candidate.phone = req.user;
+  candidate.status = 'approved';
+  res.json({ ok: true });
+});
+app.post('/api/device-link/status', (req, res) => {
+  const { requestId, secret } = req.body || {};
+  if (typeof requestId !== 'string' || typeof secret !== 'string')
+    return res.status(400).json({ error: 'Invalid device-link request.' });
+  const item = pendingDeviceLinks.get(requestId);
+  if (!item || item.secretHash !== hash(secret))
+    return res.status(404).json({ error: 'Link request was not found.' });
+  if (item.expires <= Date.now()) {
+    pendingDeviceLinks.delete(requestId);
+    return res.status(410).json({ error: 'Code expired. Request a new one.' });
+  }
+  if (item.status === 'pending') return res.json({ ok: true, status: 'pending' });
+  // One-time redemption. The signed-in device never exposes its existing token.
+  pendingDeviceLinks.delete(requestId);
+  const token = newSession(item.phone);
+  res.json({ ok: true, status: 'approved', token, user: db.accounts[item.phone] });
+});
+app.post('/api/device-link/cancel', (req, res) => {
+  const { requestId, secret } = req.body || {};
+  const item = pendingDeviceLinks.get(requestId);
+  if (item && typeof secret === 'string' && item.secretHash === hash(secret)) pendingDeviceLinks.delete(requestId);
+  res.json({ ok: true });
+});
 app.post('/api/send-otp', async (req, res) => {
   const phone = trim(req.body?.phone);
   if (!phoneValid(phone))
@@ -340,6 +431,19 @@ app.post('/api/verify-otp', (req, res) => {
   save();
   res.json({ ok: true, token, user: db.accounts[phone] });
 });
+app.post('/api/lock-reset', requireAuth, (req, res) => {
+  const record = otps.get(req.user);
+  if (!record || record.expires < Date.now())
+    return res.status(400).json({ error: 'Request a new verification code' });
+  if (++record.attempts > 5) {
+    otps.delete(req.user);
+    return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
+  }
+  if (hash(req.body?.otp) !== record.codeHash)
+    return res.status(400).json({ error: 'Incorrect verification code' });
+  otps.delete(req.user);
+  res.json({ ok: true });
+});
 app.post('/api/logout', requireAuth, (req, res) => {
   const key = hash(req.headers.authorization.replace(/^Bearer /, ''));
   delete db.sessions[key];
@@ -384,6 +488,66 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
     res.json({ url, name: f.originalname, size: f.size, mime: f.mimetype });
   } catch {
     res.status(500).json({ error: 'Upload failed. Check media storage configuration.' });
+  }
+});
+// Optional AI avatar generation. The user explicitly chooses whether to send a selfie.
+// Keep the API key on the server; never include it in the Vite client bundle.
+const avatarRequests = new Map();
+const avatarPhotoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+app.post('/api/ai-avatar', requireAuth, avatarPhotoUpload.single('selfie'), async (req, res) => {
+  if (!process.env.OPENAI_API_KEY)
+    return res.status(503).json({ error: 'AI avatars require an image API key configured by the site owner.' });
+  if ((avatarRequests.get(req.user) || 0) > Date.now() - 60000)
+    return res.status(429).json({ error: 'You can generate another avatar in one minute.' });
+  const style = trim(req.body?.style, 32);
+  const custom = trim(req.body?.prompt, 240);
+  const styles = {
+    cinematic: 'cinematic, premium photography, clean background',
+    anime: 'modern illustrated anime, beautifully shaded',
+    clay: '3D clay render, friendly editorial aesthetic',
+    neon: 'neon cyberpunk, vibrant futuristic portrait',
+    editorial: 'high-end fashion editorial, sophisticated studio lighting',
+  };
+  if (!styles[style]) return res.status(400).json({ error: 'Choose a supported avatar style.' });
+  if (req.file && !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype))
+    return res.status(400).json({ error: 'Please use a JPEG, PNG or WebP selfie.' });
+  avatarRequests.set(req.user, Date.now());
+  const prompt = req.file
+    ? `Transform the person in this reference photo into a tasteful, polished square profile avatar, retaining their recognizable facial appearance. Style: ${styles[style]}. Additional details: ${custom || 'Natural expression, excellent composition'}. Single person, head and shoulders, no text, square portrait.`
+    : `Generate a beautiful original character avatar for a social chat profile: ${styles[style]}. User description: ${custom || 'friendly expressive adult character with an elegant color palette'}. Single character, head and shoulders, no text, square portrait.`;
+  try {
+    let body, headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, endpoint;
+    if (req.file) {
+      const form = new FormData();
+      form.append('model', process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1');
+      form.append('prompt', prompt);
+      form.append('size', '1024x1024');
+      form.append('image', new Blob([req.file.buffer], { type: req.file.mimetype }), req.file.mimetype === 'image/jpeg' ? 'selfie.jpg' : req.file.mimetype === 'image/webp' ? 'selfie.webp' : 'selfie.png');
+      body = form;
+      endpoint = 'https://api.openai.com/v1/images/edits';
+    } else {
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify({ model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1', prompt, size: '1024x1024', n: 1 });
+      endpoint = 'https://api.openai.com/v1/images/generations';
+    }
+    const response = await fetch(endpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(110000) });
+    if (!response.ok) {
+      console.error('Avatar image provider error:', response.status);
+      return res.status(502).json({ error: 'Image service could not generate your avatar. Verify provider access and model configuration.' });
+    }
+    const data = await response.json();
+    const b64 = data.data?.[0]?.b64_json;
+    if (!b64 || b64.length > 12 * 1024 * 1024) throw new Error('Invalid image response');
+    const bytes = Buffer.from(b64, 'base64');
+    if (bytes.length < 512 || bytes.length > 9 * 1024 * 1024) throw new Error('Unexpected image size');
+    const id = randomUUID();
+    fs.writeFileSync(path.join(uploadsDir, id), bytes);
+    fs.writeFileSync(path.join(uploadsDir, `${id}.json`), JSON.stringify({ name: 'ai-avatar.png', mime: 'image/png' }));
+    const base = process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`;
+    res.json({ ok: true, url: `${base.replace(/\/$/, '')}/api/files/${id}` });
+  } catch (error) {
+    console.error('Avatar generation failed:', error.message);
+    res.status(502).json({ error: 'Could not create an avatar. Please try another photo or style.' });
   }
 });
 app.get('/api/files/:id', (req, res) => {
@@ -440,6 +604,8 @@ const purgeExpired = () => {
       changed = true;
     }
   for (const [p, o] of otps) if (o.expires <= Date.now()) otps.delete(p);
+  for (const [id, link] of pendingDeviceLinks) if (link.expires <= Date.now()) pendingDeviceLinks.delete(id);
+  for (const [key, limit] of deviceLinkLimits) if (limit.until <= Date.now()) deviceLinkLimits.delete(key);
   if (changed) save();
 };
 purgeExpired();
@@ -562,6 +728,8 @@ io.on('connection', (socket) => {
     me = p;
     socket.handshake.auth = { token };
     socket.data.sessionKey = hash(token);
+    socket.data.foreground = false;
+    socket.data.lastForeground = 0;
     const authSession = db.sessions[hash(token)];
     if (authSession.profilePending && trim(name, 30)) {
       db.accounts[p].name = trim(name, 30);
@@ -603,6 +771,19 @@ io.on('connection', (socket) => {
       founderPhone: phoneValid(founderPhone) ? founderPhone : null,
     });
     broadcastUsers();
+    // When a PWA is opened from a call notification, redeliver the pending offer.
+    for (const call of activeCalls.values()) {
+      if (call.to === me && !call.answeredAt) socket.emit('incoming_call', {
+        from: call.from, fromName: db.accounts[call.from]?.name || 'Contact',
+        type: call.type, offer: call.offer, callId: call.callId,
+      });
+      if (call.pendingIce?.[me])
+        for (const candidate of call.pendingIce[me]) socket.emit('call_ice', { callId: call.callId, from: call.from, candidate });
+    }
+  });
+  on('client_visibility', ({ visible }) => {
+    socket.data.foreground = visible === true;
+    socket.data.lastForeground = visible === true ? Date.now() : 0;
   });
   on('get_history', ({ with: other }, ack) => {
     const rid = roomId(me, String(other || ''));
@@ -725,9 +906,30 @@ io.on('connection', (socket) => {
     emitTo([me], 'chat_cleared', { roomId: rid });
     ack?.({ ok: true });
   });
-  on('profile', ({ name, about }, ack) => {
+  on('profile', ({ name, about, avatarUrl, avatarColor, avatarStyle, avatarFocus }, ack) => {
     if (trim(name, 30).length < 2) return ackError(ack, 'Name must contain at least 2 characters');
-    Object.assign(db.accounts[me], { name: trim(name, 30), about: trim(about, 140) });
+    if (avatarUrl !== undefined) {
+      const avatar = safeUrl(avatarUrl);
+      if (avatarUrl && (!avatar || !(
+        /^https:\/\/res\.cloudinary\.com\//.test(avatar) ||
+        ((() => {
+          const u = new URL(avatar);
+          return u.host === new URL(process.env.PUBLIC_SERVER_URL || `${socket.handshake.secure ? 'https' : 'http'}://${socket.handshake.headers.host}`).host &&
+            /^\/api\/files\/[0-9a-f-]{36}$/.test(u.pathname);
+        })())
+      ))) return ackError(ack, 'Use an uploaded profile picture');
+    }
+    if (avatarColor !== undefined && !/^#[0-9a-fA-F]{6}$/.test(avatarColor))
+      return ackError(ack, 'Choose a valid profile color');
+    if (avatarStyle !== undefined && !['initials', 'orbit', 'sparkle', 'bloom'].includes(avatarStyle))
+      return ackError(ack, 'Choose a valid avatar style');
+    if (avatarFocus !== undefined && (!Number.isFinite(avatarFocus) || avatarFocus < 0 || avatarFocus > 100))
+      return ackError(ack, 'Choose a valid photo alignment');
+    Object.assign(db.accounts[me], { name: trim(name, 30), about: trim(about, 140),
+      ...(avatarUrl !== undefined ? { avatarUrl } : {}),
+      ...(avatarColor !== undefined ? { avatarColor } : {}),
+      ...(avatarStyle !== undefined ? { avatarStyle } : {}),
+      ...(avatarFocus !== undefined ? { avatarFocus } : {}), });
     save();
     broadcastUsers();
     emitTo([me], 'profile', db.accounts[me]);
@@ -875,12 +1077,12 @@ io.on('connection', (socket) => {
       to,
       type,
       time: Date.now(),
-      status: isOnline(to) ? 'ringing' : 'missed',
+      status: 'ringing',
     };
     db.calls.push(log);
     syncCalls([me, to]);
-    if (!isOnline(to)) return ackError(ack, 'Contact is offline');
-    const c = { callId, from: me, to, timer: setTimeout(() => finishCall(c, 'missed'), 45000) };
+    const c = { callId, from: me, to, type, offer, timer: null, pendingIce: { [me]: [], [to]: [] } };
+    c.timer = setTimeout(() => finishCall(c, 'missed'), 45000);
     activeCalls.set(callId, c);
     emitTo([to], 'incoming_call', {
       from: me,
@@ -889,6 +1091,7 @@ io.on('connection', (socket) => {
       offer,
       callId,
     });
+    pushIncomingCall(c);
     ack?.({ ok: true });
   });
   for (const event of ['call_answer', 'call_ice', 'call_reject', 'call_end'])
@@ -903,14 +1106,21 @@ io.on('connection', (socket) => {
         clearTimeout(c.timer);
         log.status = 'connected';
         log.answeredAt = Date.now();
+        c.answeredAt = log.answeredAt;
         syncCalls([me, other]);
         emitTo([other], event, { from: me, answer: payload.answer, callId: c.callId });
         socket
           .to(`user:${me}`)
           .emit('call_ended', { callId: c.callId, reason: 'answered_elsewhere' });
-      } else if (event === 'call_ice')
+      } else if (event === 'call_ice') {
+        if (!payload.candidate || typeof payload.candidate.candidate !== 'string' ||
+            payload.candidate.candidate.length > 4096) return ackError(ack, 'Invalid ICE candidate');
+        // A recipient may open their device from a Web Push after initial trickle ICE.
+        // Keep candidates until the call ends so their connection can be negotiated.
+        const pending = (c.pendingIce[other] ||= []);
+        if (pending.length < 96) pending.push(payload.candidate);
         emitTo([other], event, { from: me, candidate: payload.candidate, callId: c.callId });
-      else
+      } else
         finishCall(
           c,
           event === 'call_reject'
@@ -945,7 +1155,7 @@ io.on('connection', (socket) => {
       online.delete(me);
       db.accounts[me].lastSeen = Date.now();
       for (const c of activeCalls.values())
-        if ([c.from, c.to].includes(me)) finishCall(c, 'interrupted');
+        if ([c.from, c.to].includes(me) && !(c.to === me && !c.answeredAt)) finishCall(c, 'interrupted');
       save();
       broadcastUsers();
     }
