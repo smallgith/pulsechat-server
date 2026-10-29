@@ -11,6 +11,7 @@ import multer from 'multer';
 import { v2 as cloudinary } from 'cloudinary';
 import webpush from 'web-push';
 import { writeJsonAtomically } from './storage.js';
+import { verifyGoogleCredential } from './google-auth.js';
 import { installUploads, MAX_FILE_BYTES, CHUNK_BYTES } from './uploads.js';
 import { structuredContent, installFeatures, startScheduler } from './features.js';
 
@@ -28,6 +29,7 @@ const empty = {
   statuses: [],
   calls: [],
   subscriptions: {},
+  googleLinks: {},
   scheduled: [],
   reports: [],
 };
@@ -68,9 +70,14 @@ const online = new Map(),
   activeCalls = new Map(),
   pendingDeviceLinks = new Map();
 const isOnline = (p) => !!online.get(p)?.size;
-const demoAuth = (process.env.AUTH_MODE || (process.env.NODE_ENV === 'production' ? 'sms' : 'demo')) === 'demo';
+const authMode = process.env.AUTH_MODE || (process.env.NODE_ENV === 'production' ? 'sms' : 'demo');
+const demoAuth = authMode === 'demo';
+const googleClientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
+if (!['sms', 'google', 'demo'].includes(authMode)) throw new Error('Unknown AUTH_MODE. Use google, sms or demo.');
 if (process.env.NODE_ENV === 'production' && demoAuth)
-  throw new Error('AUTH_MODE=demo is not allowed in production. Configure SMS OTP.');
+  throw new Error('AUTH_MODE=demo is not allowed in production. Use google or sms.');
+if (authMode === 'google' && !googleClientId)
+  throw new Error('AUTH_MODE=google requires GOOGLE_CLIENT_ID on the server.');
 const founderPhone = trim(process.env.FOUNDER_PHONE, 10);
 if (phoneValid(founderPhone) && !db.accounts[founderPhone]) {
   db.accounts[founderPhone] = {
@@ -196,6 +203,8 @@ const media = (f) =>
 app.get('/api/config', (_req, res) =>
   res.json({
     demoAuth,
+    authMode,
+    googleClientId,
     founderPhone: phoneValid(founderPhone) ? founderPhone : null,
     maxFileSize: MAX_FILE_BYTES,
     chunkSize: CHUNK_BYTES,
@@ -358,7 +367,53 @@ app.post('/api/device-link/cancel', (req, res) => {
   if (item && typeof secret === 'string' && item.secretHash === hash(secret)) pendingDeviceLinks.delete(requestId);
   res.json({ ok: true });
 });
+// Free, production-safe login: verify the signed Google ID token cryptographically.
+// Google identities are separate from phone identities; no automatic account takeover/merge.
+app.post('/api/auth/google', async (req, res) => {
+  if (!googleClientId) return res.status(503).json({ ok: false, error: 'Google Sign-In is not configured' });
+  try {
+    const identity = await verifyGoogleCredential(req.body?.credential, googleClientId);
+    const accountId = db.googleLinks[identity.id] || identity.id;
+    const previous = db.accounts[accountId];
+    if (!previous) {
+      db.accounts[accountId] = {
+        phone: accountId, name: identity.name || 'PulseChat User', email: identity.email,
+        about: 'Available', joinedAt: Date.now(), lastSeen: null,
+      };
+      save();
+    } else if (previous.email !== identity.email) {
+      // Google 'sub' is the immutable account identity. Email can change.
+      previous.email = identity.email;
+      save();
+    }
+    const token = newSession(accountId);
+    res.json({ ok: true, token, user: db.accounts[accountId] });
+  } catch (error) {
+    const reason = /signing keys are unavailable/.test(error.message) ? 503 : 401;
+    res.status(reason).json({ ok: false, error: reason === 503 ? 'Google Sign-In temporarily unavailable' : 'Google verification failed. Try again.' });
+  }
+});
+// Explicitly link an existing, already-authenticated phone account to Google.
+// Prevent hijacking another account or silently merging two accounts' histories.
+app.post('/api/auth/google/link', requireAuth, async (req, res) => {
+  if (!googleClientId) return res.status(503).json({ ok: false, error: 'Google Sign-In is not configured' });
+  try {
+    const identity = await verifyGoogleCredential(req.body?.credential, googleClientId);
+    const existing = db.googleLinks[identity.id];
+    if ((existing && existing !== req.user) || (db.accounts[identity.id] && req.user !== identity.id))
+      return res.status(409).json({ ok: false, error: 'That Google account is already in use.' });
+    if (req.user.startsWith('google:') && req.user !== identity.id)
+      return res.status(409).json({ ok: false, error: 'You cannot link another Google identity.' });
+    db.googleLinks[identity.id] = req.user;
+    db.accounts[req.user].googleLinked = true;
+    save();
+    res.json({ ok: true });
+  } catch {
+    res.status(401).json({ ok: false, error: 'Google verification failed. Try again.' });
+  }
+});
 app.post('/api/send-otp', async (req, res) => {
+  if (authMode === 'google') return res.status(400).json({ ok: false, error: 'SMS is disabled. Please use free Google Sign-In.' });
   const phone = trim(req.body?.phone);
   if (!phoneValid(phone))
     return res.status(400).json({ ok: false, error: 'Enter a 10-digit mobile number' });
@@ -431,7 +486,14 @@ app.post('/api/verify-otp', (req, res) => {
   save();
   res.json({ ok: true, token, user: db.accounts[phone] });
 });
-app.post('/api/lock-reset', requireAuth, (req, res) => {
+app.post('/api/lock-reset', requireAuth, async (req, res) => {
+  if (req.user.startsWith('google:') || req.body?.googleCredential) {
+    try {
+      const identity = await verifyGoogleCredential(req.body?.googleCredential, googleClientId);
+      if (identity.id !== req.user && db.googleLinks[identity.id] !== req.user) return res.status(403).json({ error: 'Google account does not match the signed-in user.' });
+      return res.json({ ok: true });
+    } catch { return res.status(401).json({ error: 'Verify your Google account to reset the PIN.' }); }
+  }
   const record = otps.get(req.user);
   if (!record || record.expires < Date.now())
     return res.status(400).json({ error: 'Request a new verification code' });
