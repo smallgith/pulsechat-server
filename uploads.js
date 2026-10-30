@@ -40,7 +40,7 @@ export function installUploads(app, { dataDir, uploadsDir, requireAuth }) {
   const offset = (id) => (fs.existsSync(partPath(id)) ? fs.statSync(partPath(id)).size : 0);
   const result = (req, meta) => ({
     id: meta.id,
-    url: `${process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`}/api/files/${meta.id}`,
+    url: `${(process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '')}/api/files/${meta.id}`,
     name: meta.name,
     mime: meta.mime,
     size: meta.size,

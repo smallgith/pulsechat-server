@@ -13,6 +13,7 @@ import webpush from 'web-push';
 import { writeJsonAtomically } from './storage.js';
 import { verifyGoogleCredential } from './google-auth.js';
 import { installUploads, MAX_FILE_BYTES, CHUNK_BYTES } from './uploads.js';
+import { attachmentHeaders, installDownloads } from './downloads.js';
 import { structuredContent, installFeatures, startScheduler } from './features.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -103,7 +104,7 @@ const origin = (value, cb) => {
       /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(value)
   );
 };
-app.use(cors({ origin, credentials: true }));
+app.use(cors({ origin, credentials: true, exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Range'] }));
 app.use(express.json({ limit: '256kb' }));
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -520,6 +521,7 @@ app.post('/api/logout', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 installUploads(app, { dataDir, uploadsDir, requireAuth });
+installDownloads(app, { cloudName: process.env.CLOUDINARY_CLOUD_NAME });
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -548,7 +550,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
         path.join(uploadsDir, `${id}.json`),
         JSON.stringify({ name: f.originalname, mime: f.mimetype })
       );
-      url = `${process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`}/api/files/${id}`;
+      url = `${(process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '')}/api/files/${id}`;
     }
     res.json({ url, name: f.originalname, size: f.size, mime: f.mimetype });
   } catch {
@@ -621,17 +623,19 @@ app.get('/api/files/:id', (req, res) => {
   if (!fs.existsSync(file)) return res.sendStatus(404);
   const meta = JSON.parse(fs.readFileSync(`${file}.json`, 'utf8'));
   res.set('X-Content-Type-Options', 'nosniff');
-  res.set('Content-Security-Policy', "default-src 'none'; sandbox");
+  res.set('Content-Security-Policy', "default-src 'none'; sandbox allow-downloads");
   const mime = meta.mime.split(';')[0];
   const inline =
     /^(image\/(png|jpeg|gif|webp|avif)|video\/(mp4|webm|ogg)|audio\/(webm|ogg|mpeg|mp4|wav))$/.test(
       mime
     );
   res.type(inline ? mime : 'application/octet-stream');
-  res.set(
-    'Content-Disposition',
-    `${req.query.download === '1' ? 'attachment' : inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(meta.name)}`
-  );
+  if (req.query.download === '1' || !inline) {
+    attachmentHeaders(res, meta.name);
+    res.type(inline ? mime : 'application/octet-stream');
+  } else {
+    res.set('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(meta.name)}`);
+  }
   res.sendFile(file);
 });
 app.use((err, req, res, _next) =>
