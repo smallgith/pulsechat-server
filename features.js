@@ -104,7 +104,7 @@ export function installFeatures({
   syncGroups,
   syncPrefs,
   deliverMessage,
-  founderPhone,
+  getFounder,
 }) {
   const schedules = (me) =>
     (db.scheduled || [])
@@ -320,17 +320,17 @@ export function installFeatures({
       state: 'open',
     });
     save();
-    if (founderPhone) emitTo([founderPhone], 'reports', db.reports);
+    if (getFounder()) emitTo([getFounder()], 'reports', db.reports);
     ack?.({ ok: true });
   });
   on('resolve_report', ({ id }, ack) => {
-    if (getMe() !== founderPhone)
+    if (getMe() !== getFounder())
       return ack?.({ ok: false, error: 'Only the site founder can review reports' });
     const report = db.reports?.find((r) => r.id === id);
     if (!report) return ack?.({ ok: false, error: 'Report not found' });
     report.state = 'reviewed';
     save();
-    emitTo([founderPhone], 'reports', db.reports);
+    emitTo([getFounder()], 'reports', db.reports);
     ack?.({ ok: true });
   });
 }

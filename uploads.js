@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import express from 'express';
 import { writeJsonAtomically, renameWithRetry } from './storage.js';
+import { localFileUrl } from './public-url.js';
 
 export const CHUNK_BYTES = 4 * 1024 * 1024;
 const configuredLimit = Number(process.env.MAX_UPLOAD_MB || 2048);
@@ -40,7 +41,7 @@ export function installUploads(app, { dataDir, uploadsDir, requireAuth }) {
   const offset = (id) => (fs.existsSync(partPath(id)) ? fs.statSync(partPath(id)).size : 0);
   const result = (req, meta) => ({
     id: meta.id,
-    url: `${(process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '')}/api/files/${meta.id}`,
+    url: localFileUrl(req, meta.id),
     name: meta.name,
     mime: meta.mime,
     size: meta.size,

@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { io } from 'socket.io-client';
+import { googleCredential, testGoogleClientId } from './support/google-fixture.js';
+import { createHash } from 'node:crypto';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dataDir = mkdtempSync(path.join(tmpdir(), 'pulsechat-test-'));
@@ -15,9 +17,9 @@ const sockets = [];
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 async function start() {
   output = '';
-  server = spawn(process.execPath, ['index.js'], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, AUTH_MODE: 'demo', CLIENT_URL: '*', FOUNDER_PHONE: '9000000099', FOUNDER_NAME: 'Test founder', CLOUDINARY_CLOUD_NAME: '', CLOUDINARY_API_KEY: '', CLOUDINARY_API_SECRET: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  server = spawn(process.execPath, ['--import', './test/support/google-provider.js', 'index.js'], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, GOOGLE_CLIENT_ID: testGoogleClientId, CLIENT_URL: '*', FOUNDER_PHONE: '9000000099', FOUNDER_NAME: 'Test founder', CLOUDINARY_CLOUD_NAME: '', CLOUDINARY_API_KEY: '', CLOUDINARY_API_SECRET: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
   server.stdout.on('data', (d) => { output += d; }); server.stderr.on('data', (d) => { output += d; });
-  for (let i = 0; i < 100; i++) { try { if ((await fetch(`${url}/api/health`)).ok) return; } catch {} await delay(50); }
+  for (let i = 0; i < 300; i++) { try { if ((await fetch(`${url}/api/health`)).ok) return; } catch {} if (server.exitCode !== null) break; await delay(50); }
   throw new Error(`Server did not start: ${output}`);
 }
 async function stop() { if (!server || server.exitCode !== null) return; const ended = new Promise((r) => server.once('exit', r)); server.kill(); await ended; }
@@ -33,23 +35,31 @@ async function connect(token, name) {
   return { s, ...result };
 }
 async function login(phone, name) {
-  assert.equal((await api('send-otp', { phone })).ok, true);
-  const auth = await api('verify-otp', { phone, otp: '111111' }); assert.ok(auth.token);
-  return { token: auth.token, phone, ...(await connect(auth.token, name)) };
+  const auth = await api('auth/google', { credential: googleCredential(phone, name) }); assert.ok(auth.token);
+  assert.ok(auth.expiresAt >= Date.now() + 31 * 86400000);
+  return { token: auth.token, phone: auth.user.phone, ...(await connect(auth.token, name)) };
 }
-before(start);
+const legacyPhone = '9000000044', legacyToken = 'previous-version-session-token';
+before(async () => {
+  writeFileSync(path.join(dataDir, 'chat.json'), JSON.stringify({
+    accounts: { [legacyPhone]: { phone: legacyPhone, name: 'Legacy user', joinedAt: Date.now() } },
+    sessions: { [createHash('sha256').update(legacyToken).digest('hex')]: {
+      phone: legacyPhone, expires: Date.now() + 30 * 86400000,
+    } },
+  }));
+  await start();
+});
 after(async () => { sockets.forEach((s) => s.disconnect()); await stop(); if (!path.resolve(dataDir).startsWith(path.join(tmpdir(), 'pulsechat-test-'))) throw new Error('Unsafe temporary directory'); rmSync(dataDir, { recursive: true, force: true }); });
 
 test('real-time messaging, permissions, groups, calls and persistence', async (t) => {
   const a = await login('9000000001', 'Aarav'), b = await login('9000000002', 'Bela'), c = await login('9000000003', 'Chirag');
   let message, group;
   const rid = [a.phone, b.phone].sort().join('::');
-  await t.test('OTP sessions are required, retry-limited and founder is configured', async () => {
+  await t.test('Google sessions are required, SMS is removed and founder is configured', async () => {
     const unauth = await connect('forged-token'); assert.equal(unauth.ok, false);
-    assert.equal((await api('send-otp', { phone: '123' })).status, 400);
-    assert.equal((await api('send-otp', { phone: '9000000044' })).ok, true);
-    assert.equal((await api('send-otp', { phone: '9000000044' })).status, 429);
-    assert.equal((await api('verify-otp', { phone: '9000000044', otp: '000000' })).ok, false);
+    assert.equal((await api('send-otp', { phone: '9000000044' })).status, 410);
+    assert.equal((await api('verify-otp', { phone: '9000000044', otp: '111111' })).status, 410);
+    assert.equal((await api('auth/google', { credential: 'forged' })).status, 401);
     assert.ok(a.users.some((u) => u.isFounder && u.name === 'Test founder'));
     const malformed = io(url, { reconnection: false }); sockets.push(malformed);
     await new Promise((resolve) => malformed.once('connect', resolve)); malformed.emit('register', null, 'not-an-ack');
@@ -65,6 +75,17 @@ test('real-time messaging, permissions, groups, calls and persistence', async (t
     const history = await emit(a.s, 'get_history', { with: b.phone });
     assert.equal(history.messages.length, 1); assert.equal(history.messages[0].status, 'seen');
     assert.equal((await emit(c.s, 'seen', { roomId: rid, ids: [message.id] })).ok, false);
+  });
+  await t.test('legacy accounts explicitly link Google and reset PINs through the same verified identity', async () => {
+    const credential = googleCredential('legacy-google-identity', 'Legacy user');
+    assert.equal((await api('auth/google/link', { credential }, legacyToken)).status, 200);
+    const linked = await api('auth/google', { credential });
+    assert.equal(linked.user.phone, legacyPhone);
+    assert.equal((await api('lock-reset', { googleCredential: credential }, linked.token)).status, 200);
+    assert.equal((await api('lock-reset', { googleCredential: googleCredential('another-identity') }, linked.token)).status, 403);
+    const session = await fetch(`${url}/api/session`, { headers: { Authorization: `Bearer ${linked.token}` } });
+    assert.equal(session.status, 200);
+    assert.ok((await session.json()).expiresAt > Date.now() + 31 * 86400000);
   });
   await t.test('edit/reply/react/forward and owner authorization', async () => {
     assert.equal((await emit(b.s, 'edit_message', { roomId: rid, messageId: message.id, text: 'forged' })).ok, false);
@@ -133,7 +154,8 @@ test('real-time messaging, permissions, groups, calls and persistence', async (t
     const answer = new Promise((r) => a.s.once('call_answer', r));
     await emit(b.s, 'call_answer', { callId: call.callId, answer: { type: 'answer', sdp: 'test-answer' } }); assert.equal((await answer).answer.sdp, 'test-answer');
     const logs = new Promise((r) => a.s.once('calls', r)); await emit(a.s, 'call_end', { callId: call.callId }); assert.equal((await logs)[0].status, 'completed');
-    assert.equal((await emit(a.s, 'call_user', { ...call, to: '9000000099', callId: 'offline-call' })).ok, false);
+    assert.equal((await emit(a.s, 'call_user', { ...call, to: '9000000099', callId: 'offline-call' })).ok, true);
+    assert.equal((await emit(a.s, 'call_end', { callId: 'offline-call' })).ok, true);
   });
   await t.test('delete for me is private and delete for everyone removes content', async () => {
     await emit(b.s, 'delete_message', { roomId: rid, messageId: message.id, forEveryone: false });

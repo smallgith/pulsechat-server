@@ -14,10 +14,14 @@ import { writeJsonAtomically } from './storage.js';
 import { verifyGoogleCredential } from './google-auth.js';
 import { installUploads, MAX_FILE_BYTES, CHUNK_BYTES } from './uploads.js';
 import { attachmentHeaders, installDownloads } from './downloads.js';
+import { localFileUrl } from './public-url.js';
+import { sessionStore, SESSION_DAYS } from './sessions.js';
 import { structuredContent, installFeatures, startScheduler } from './features.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, 'data'));
+if (process.env.RENDER && !process.env.DATA_DIR)
+  console.warn('DATA_DIR is unset on Render. Configure persistent storage to retain sessions and files across restarts/deploys.');
 const uploadsDir = path.join(dataDir, 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true });
 const dataFile = path.join(dataDir, 'chat.json');
@@ -39,6 +43,7 @@ const db = fs.existsSync(dataFile)
   ? { ...empty, ...JSON.parse(fs.readFileSync(dataFile, 'utf8')) }
   : empty;
 const save = () => writeJsonAtomically(dataFile, db);
+const sessions = sessionStore(db, save);
 const vapidFile = path.join(dataDir, 'vapid.json');
 const vapid = fs.existsSync(vapidFile)
   ? JSON.parse(fs.readFileSync(vapidFile, 'utf8'))
@@ -67,20 +72,16 @@ const prefs = (p) =>
     hidden: [],
   });
 const online = new Map(),
-  otps = new Map(),
   activeCalls = new Map(),
   groupCalls = new Map(),
   pendingDeviceLinks = new Map();
 const isOnline = (p) => !!online.get(p)?.size;
-const authMode = process.env.AUTH_MODE || (process.env.NODE_ENV === 'production' ? 'sms' : 'demo');
-const demoAuth = authMode === 'demo';
+const authMode = 'google';
 const googleClientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
-if (!['sms', 'google', 'demo'].includes(authMode)) throw new Error('Unknown AUTH_MODE. Use google, sms or demo.');
-if (process.env.NODE_ENV === 'production' && demoAuth)
-  throw new Error('AUTH_MODE=demo is not allowed in production. Use google or sms.');
-if (authMode === 'google' && !googleClientId)
-  throw new Error('AUTH_MODE=google requires GOOGLE_CLIENT_ID on the server.');
-const founderPhone = trim(process.env.FOUNDER_PHONE, 10);
+if (!googleClientId) throw new Error('Set GOOGLE_CLIENT_ID on the server to enable Google Sign-In.');
+const founderEmail = trim(process.env.FOUNDER_EMAIL, 254).toLowerCase();
+let founderPhone = Object.values(db.accounts).find((account) => founderEmail && account.email === founderEmail)?.phone
+  || trim(process.env.FOUNDER_PHONE, 10);
 if (phoneValid(founderPhone) && !db.accounts[founderPhone]) {
   db.accounts[founderPhone] = {
     phone: founderPhone,
@@ -92,6 +93,7 @@ if (phoneValid(founderPhone) && !db.accounts[founderPhone]) {
 }
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 const origin = (value, cb) => {
   const allowed = (process.env.CLIENT_URL || '*')
     .split(',')
@@ -143,13 +145,10 @@ const messageStatus = (m) => {
 const messagePublic = (m) => ({ ...m, status: messageStatus(m) });
 const emitMessage = (m, event = 'message_updated') =>
   emitTo(membersOf(m.roomId), event, messagePublic(m));
-const sessionUser = (token) => {
-  const session = db.sessions[hash(token || '')];
-  return session?.expires > Date.now() && db.accounts[session.phone] ? session.phone : null;
-};
+const sessionUser = sessions.user;
 const requireAuth = (req, res, next) => {
   req.user = sessionUser(req.headers.authorization?.replace(/^Bearer /, ''));
-  if (!req.user) return res.status(401).json({ error: 'Please sign in again' });
+  if (!req.user) return res.status(401).json({ code: 'SESSION_EXPIRED', error: 'Please sign in with Google again' });
   next();
 };
 const visibleStatuses = (me) =>
@@ -204,16 +203,19 @@ const media = (f) =>
 
 app.get('/api/config', (_req, res) =>
   res.json({
-    demoAuth,
     authMode,
+    sessionDays: SESSION_DAYS,
     googleClientId,
-    founderPhone: phoneValid(founderPhone) ? founderPhone : null,
+    founderPhone: founderPhone || null,
     maxFileSize: MAX_FILE_BYTES,
     chunkSize: CHUNK_BYTES,
     maxFiles: 20,
   })
 );
 app.get('/api/health', (_req, res) => res.json({ ok: true, online: online.size }));
+app.get('/api/session', requireAuth, (req, res) => res.json({
+  ok: true, expiresAt: sessions.expires(req.headers.authorization?.replace(/^Bearer /, '')),
+}));
 app.get('/api/push/key', requireAuth, (_req, res) => res.json({ publicKey: vapid.publicKey }));
 app.post('/api/push/subscribe', requireAuth, (req, res) => {
   const s = req.body;
@@ -322,12 +324,7 @@ const deviceLinkRateLimit = (key, max = 10, windowMs = 60000) => {
   deviceLinkLimits.set(key, record);
   return record.count <= max;
 };
-const newSession = (phone) => {
-  const token = randomBytes(32).toString('hex');
-  db.sessions[hash(token)] = { phone, expires: Date.now() + 30 * 86400000, profilePending: false };
-  save();
-  return token;
-};
+const newSession = sessions.create;
 app.post('/api/device-link/start', (req, res) => {
   if (!deviceLinkRateLimit(`start:${req.ip}`, 8, 60000))
     return res.status(429).json({ error: 'Too many requests. Try again shortly.' });
@@ -374,10 +371,13 @@ app.post('/api/device-link/cancel', (req, res) => {
 // Free, production-safe login: verify the signed Google ID token cryptographically.
 // Google identities are separate from phone identities; no automatic account takeover/merge.
 app.post('/api/auth/google', async (req, res) => {
+  if (!deviceLinkRateLimit(`google:${req.ip}`, 30, 60000))
+    return res.status(429).json({ ok: false, error: 'Too many sign-in attempts. Try again in a minute.' });
   if (!googleClientId) return res.status(503).json({ ok: false, error: 'Google Sign-In is not configured' });
   try {
     const identity = await verifyGoogleCredential(req.body?.credential, googleClientId);
     const accountId = db.googleLinks[identity.id] || identity.id;
+    if (founderEmail && identity.email === founderEmail) founderPhone = accountId;
     const previous = db.accounts[accountId];
     if (!previous) {
       db.accounts[accountId] = {
@@ -391,7 +391,7 @@ app.post('/api/auth/google', async (req, res) => {
       save();
     }
     const token = newSession(accountId);
-    res.json({ ok: true, token, user: db.accounts[accountId] });
+    res.json({ ok: true, token, expiresAt: sessions.expires(token), user: db.accounts[accountId] });
   } catch (error) {
     const reason = /signing keys are unavailable/.test(error.message) ? 503 : 401;
     res.status(reason).json({ ok: false, error: reason === 503 ? 'Google Sign-In temporarily unavailable' : 'Google verification failed. Try again.' });
@@ -416,99 +416,17 @@ app.post('/api/auth/google/link', requireAuth, async (req, res) => {
     res.status(401).json({ ok: false, error: 'Google verification failed. Try again.' });
   }
 });
-app.post('/api/send-otp', async (req, res) => {
-  if (authMode === 'google') return res.status(400).json({ ok: false, error: 'SMS is disabled. Please use free Google Sign-In.' });
-  const phone = trim(req.body?.phone);
-  if (!phoneValid(phone))
-    return res.status(400).json({ ok: false, error: 'Enter a 10-digit mobile number' });
-  const previous = otps.get(phone);
-  if (previous && previous.sentAt > Date.now() - 30000)
-    return res
-      .status(429)
-      .json({ ok: false, error: 'Wait 30 seconds before requesting another code' });
-  const code = demoAuth ? '111111' : String(randomInt(100000, 1000000));
-  otps.set(phone, {
-    codeHash: hash(code),
-    expires: Date.now() + 300000,
-    sentAt: Date.now(),
-    attempts: 0,
-  });
-  if (!demoAuth) {
-    const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: token, TWILIO_FROM: from } = process.env;
-    if (!sid || !token || !from) {
-      otps.delete(phone);
-      return res
-        .status(503)
-        .json({ ok: false, error: 'SMS delivery is not configured by the site owner' });
-    }
-    try {
-      const response = await fetch(
-        `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: new URLSearchParams({
-            To: `${process.env.PHONE_COUNTRY_CODE || '+91'}${phone}`,
-            From: from,
-            Body: `Your PulseChat code is ${code}. Valid for 5 minutes.`,
-          }),
-          signal: AbortSignal.timeout(15000),
-        }
-      );
-      if (!response.ok) throw new Error('SMS delivery failed');
-    } catch {
-      otps.delete(phone);
-      return res.status(502).json({ ok: false, error: 'Could not send SMS. Try again.' });
-    }
-  }
-  res.json({ ok: true, demoAuth, hint: demoAuth ? 'Demo code: 111111' : undefined });
-});
-app.post('/api/verify-otp', (req, res) => {
-  const phone = trim(req.body?.phone),
-    record = otps.get(phone);
-  if (!record || record.expires < Date.now())
-    return res.status(400).json({ ok: false, error: 'Request a new code' });
-  if (++record.attempts > 5) {
-    otps.delete(phone);
-    return res.status(429).json({ ok: false, error: 'Too many attempts. Request a new code.' });
-  }
-  if (hash(req.body?.otp) !== record.codeHash)
-    return res.status(400).json({ ok: false, error: 'Incorrect code' });
-  otps.delete(phone);
-  db.accounts[phone] ||= {
-    phone,
-    name: `User ${phone.slice(-4)}`,
-    about: 'Available',
-    joinedAt: Date.now(),
-    lastSeen: null,
-  };
-  const token = randomBytes(32).toString('hex');
-  db.sessions[hash(token)] = { phone, expires: Date.now() + 30 * 86400000, profilePending: true };
-  save();
-  res.json({ ok: true, token, user: db.accounts[phone] });
-});
+// Compatibility response for older clients. Phone/SMS authentication has been removed.
+app.post(['/api/send-otp', '/api/verify-otp'], (_req, res) =>
+  res.status(410).json({ ok: false, error: 'Phone sign-in was removed. Continue with Google.' })
+);
 app.post('/api/lock-reset', requireAuth, async (req, res) => {
-  if (req.user.startsWith('google:') || req.body?.googleCredential) {
-    try {
-      const identity = await verifyGoogleCredential(req.body?.googleCredential, googleClientId);
-      if (identity.id !== req.user && db.googleLinks[identity.id] !== req.user) return res.status(403).json({ error: 'Google account does not match the signed-in user.' });
-      return res.json({ ok: true });
-    } catch { return res.status(401).json({ error: 'Verify your Google account to reset the PIN.' }); }
-  }
-  const record = otps.get(req.user);
-  if (!record || record.expires < Date.now())
-    return res.status(400).json({ error: 'Request a new verification code' });
-  if (++record.attempts > 5) {
-    otps.delete(req.user);
-    return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
-  }
-  if (hash(req.body?.otp) !== record.codeHash)
-    return res.status(400).json({ error: 'Incorrect verification code' });
-  otps.delete(req.user);
-  res.json({ ok: true });
+  try {
+    const identity = await verifyGoogleCredential(req.body?.googleCredential, googleClientId);
+    if (identity.id !== req.user && db.googleLinks[identity.id] !== req.user)
+      return res.status(403).json({ error: 'Google account does not match the signed-in user.' });
+    res.json({ ok: true });
+  } catch { res.status(401).json({ error: 'Verify your Google account to reset the PIN.' }); }
 });
 app.post('/api/logout', requireAuth, (req, res) => {
   const key = hash(req.headers.authorization.replace(/^Bearer /, ''));
@@ -550,7 +468,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
         path.join(uploadsDir, `${id}.json`),
         JSON.stringify({ name: f.originalname, mime: f.mimetype })
       );
-      url = `${(process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '')}/api/files/${id}`;
+      url = localFileUrl(req, id);
     }
     res.json({ url, name: f.originalname, size: f.size, mime: f.mimetype });
   } catch {
@@ -610,8 +528,7 @@ app.post('/api/ai-avatar', requireAuth, avatarPhotoUpload.single('selfie'), asyn
     const id = randomUUID();
     fs.writeFileSync(path.join(uploadsDir, id), bytes);
     fs.writeFileSync(path.join(uploadsDir, `${id}.json`), JSON.stringify({ name: 'ai-avatar.png', mime: 'image/png' }));
-    const base = process.env.PUBLIC_SERVER_URL || `${req.protocol}://${req.get('host')}`;
-    res.json({ ok: true, url: `${base.replace(/\/$/, '')}/api/files/${id}` });
+    res.json({ ok: true, url: localFileUrl(req, id) });
   } catch (error) {
     console.error('Avatar generation failed:', error.message);
     res.status(502).json({ error: 'Could not create an avatar. Please try another photo or style.' });
@@ -672,7 +589,6 @@ const purgeExpired = () => {
       delete db.sessions[key];
       changed = true;
     }
-  for (const [p, o] of otps) if (o.expires <= Date.now()) otps.delete(p);
   for (const [id, link] of pendingDeviceLinks) if (link.expires <= Date.now()) pendingDeviceLinks.delete(id);
   for (const [key, limit] of deviceLinkLimits) if (limit.until <= Date.now()) deviceLinkLimits.delete(key);
   if (changed) save();
@@ -816,7 +732,7 @@ io.on('connection', (socket) => {
     if (typeof ack !== 'function') ack = undefined;
     const { token, name } = payload || {};
     const p = sessionUser(token);
-    if (!p) return ackError(ack, 'Session expired. Sign in with your code again.');
+    if (!p) return ack?.({ ok: false, code: 'SESSION_EXPIRED', error: 'Session expired. Sign in with Google again.' });
     if (me) return ackError(ack, 'Already signed in');
     me = p;
     socket.handshake.auth = { token };
@@ -846,6 +762,7 @@ io.on('connection', (socket) => {
     ack?.({
       ok: true,
       user: db.accounts[me],
+      expiresAt: sessions.expires(token),
       users: usersPublic(),
       preferences: prefs(me),
       groups: Object.values(db.groups)
@@ -862,7 +779,7 @@ io.on('connection', (socket) => {
         .filter((c) => c.from === me || c.to === me || c.members?.includes(me))
         .slice(-100)
         .reverse(),
-      founderPhone: phoneValid(founderPhone) ? founderPhone : null,
+      founderPhone: founderPhone || null,
     });
     broadcastUsers();
     for (const groupCall of groupCalls.values()) {
@@ -1319,7 +1236,7 @@ io.on('connection', (socket) => {
     syncGroups,
     syncPrefs,
     deliverMessage,
-    founderPhone,
+    getFounder: () => founderPhone,
   });
   socket.on('disconnect', () => {
     if (!me) return;
@@ -1338,6 +1255,6 @@ io.on('connection', (socket) => {
 });
 server.listen(process.env.PORT || 5000, () =>
   console.log(
-    `PulseChat listening on ${process.env.PORT || 5000} (${demoAuth ? 'demo login' : 'SMS login'})`
+    `PulseChat listening on ${process.env.PORT || 5000} (Google Sign-In, ${SESSION_DAYS}-day sessions)`
   )
 );

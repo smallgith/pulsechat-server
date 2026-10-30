@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { io } from 'socket.io-client';
+import { googleCredential, testGoogleClientId } from './support/google-fixture.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dir = fs.mkdtempSync(path.join(tmpdir(), 'pulsechat-features-'));
@@ -38,16 +39,17 @@ async function api(route, token, body, method = 'POST', headers = {}) {
 }
 async function start() {
   logs = '';
-  server = spawn(process.execPath, ['index.js'], {
+  server = spawn(process.execPath, ['--import', './test/support/google-provider.js', 'index.js'], {
     cwd: root,
     env: {
       ...process.env,
       PORT: String(port),
       DATA_DIR: dir,
       PUBLIC_SERVER_URL: base,
-      AUTH_MODE: 'demo',
+      GOOGLE_CLIENT_ID: testGoogleClientId,
       CLIENT_URL: '*',
       FOUNDER_PHONE: '9880000099',
+      FOUNDER_EMAIL: '9880000099@example.test',
       MAX_UPLOAD_MB: '2048',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -58,7 +60,7 @@ async function start() {
   server.stderr.on('data', (v) => {
     logs += v;
   });
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 300; i++) {
     try {
       if ((await fetch(`${base}/api/health`)).ok) return;
     } catch {}
@@ -86,9 +88,8 @@ async function reconnect(user) {
   return state;
 }
 async function login(phone, name) {
-  await api('send-otp', null, { phone });
-  const auth = await api('verify-otp', null, { phone, otp: '111111' });
-  const user = { phone, name, token: auth.token };
+  const auth = await api('auth/google', null, { credential: googleCredential(phone, name) });
+  const user = { phone: auth.user.phone, name, token: auth.token };
   await reconnect(user);
   return user;
 }
@@ -291,7 +292,7 @@ test('poll votes, task workflow, decisions, contacts, stickers and event RSVPs p
     response: 'going',
   });
   assert.equal(
-    (await emit(a.s, 'send_message', { to: b.phone, contact: { name: 'Cara', phone: c.phone } }))
+    (await emit(a.s, 'send_message', { to: b.phone, contact: { name: 'Cara', phone: '9880000003' } }))
       .ok,
     true
   );

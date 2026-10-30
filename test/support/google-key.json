@@ -1,0 +1,12 @@
+{
+  "purpose": "Local automated tests only. This key is never trusted by the production Google verifier.",
+  "publicJwk": {
+    "kty": "RSA",
+    "n": "tENxhs_ieCa2eGMhLQ_qsxrhHi6nCB4KrAUyd_h1EEbQz9sLLjBjWcD7s5BtbNhlX-LFlxRWg7ecWS8WjUhx-nn25z_nm__EL_uhg3ysX0_pknPYgyKAWJH1RfUmTxDaiwsdt60hiCxNh2Jyai05j0k0P4JJ2nW4nv5iIu5H3zS4XLQVjXMOCSYmd9TcjCf5dEcoY2FgEPaPF1BLp9cJO3i0uZhXjuMn5CdYWxmVHsSxws3oHSaOGGWeKbTojGv0mAIhpp2VLTSdXqT-kI0nt0LnGqtIVvRQnH6T3Q6TOmPJHh9yZqAbpGY7RfJvcg7EPuHTf0UW6_dncyE5AhzbzQ",
+    "e": "AQAB",
+    "kid": "pulsechat-test-google",
+    "alg": "RS256",
+    "use": "sig"
+  },
+  "privateKey": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC0Q3GGz+J4JrZ4\nYyEtD+qzGuEeLqcIHgqsBTJ3+HUQRtDP2wsuMGNZwPuzkG1s2GVf4sWXFFaDt5xZ\nLxaNSHH6efbnP+eb/8Qv+6GDfKxfT+mSc9iDIoBYkfVF9SZPENqLCx23rSGILE2H\nYnJqLTmPSTQ/gknadbie/mIi7kffNLhctBWNcw4JJiZ31NyMJ/l0RyhjYWAQ9o8X\nUEun1wk7eLS5mFeO4yfkJ1hbGZUexLHCzegdJo4YZZ4ptOiMa/SYAiGmnZUtNJ1e\npP6QjSe3Qucaq0hW9FCcfpPdDpM6Y8keH3JmoBukZjtF8m9yDsQ+4dN/RRbr92dz\nITkCHNvNAgMBAAECggEAC9nNOlwrWtPMtjBqK3C68MhpGVde0slK0VFMJpf2djn5\nm1ierQwwU+O8iGsLzpaRX5Lkg5CqOWGWTUSrumETYTCoez53xwkzCCaGUUMef+uc\nguzLxJ89idUap109BgCpJW/3Ja6joDStaiOeOv27JYDeBvjVSx/nIci+geZhYjqU\nLABLAIw1ZIcae3UDh7xQiZ1tWKbe7K6Rf2fBqdu50VoTPek5MSar5o5Q1Oef05aI\ntzvlr8/qWSWBIzpZ4Mgb/nPTLb7LPSpphlA9TSjsGb1ac0n3HgPcT6eby/YH2nmw\nVeVDEcxPvkXzxb/2lfw27rSfGBUBy2jvpaXj24PSnwKBgQDtJnn3ndQVI8y7OkgT\nBJaBZcZDu4MCZTETQMLc63e77FWKtknx4mV2eEPTwAb0RICeGLS9QsaaGcnaWVC7\nF/BIoY4sjAfEGN3RrEy2w1KskEVwPxS4JmYJNNErRggVBkxIIBdw8ov5Og4FbFHB\nap+SDdp19xnK2d/FIOqI+NscrwKBgQDCl2+fRHx75bS+Lv4vpz84EXn5LgUwzsTK\nLnmkeNnXCLvrtu1cxMVoJW+/816jofJM5a/xnyErR1+06okg/8m619WDWFJRx658\nCMB2TUJ8qGdsilb9/ocR7asftdfzUJwTTX8M8ndyviQocIEUWVLMpuFKasf8/bLM\nnxFfh/vGQwKBgBo/xgRIbe8hFUor+0pPmbEc6MMagDfFp5bv9iGp1ojwcc92udyS\nKJTiXu+TM7HZ2zqklWzVdVIdRKBsfmkXDzua1jfMEBf+gJ7yqVMZb482MNlpwgtY\nBLdEJ1rY15AsMElTdATGdAPUDzU+dhYojR0Hd4TTIwG29/PD3vHmSap1AoGBAKUz\n2eEWTLUHHD6GOOiODd70/1+sUV3RfULE2CLpMtAbqycAA15J8+pqNgh5fnRfbg0Y\nxxnT5l4O11MJ9uecIVDOIofC+QhTBXBqIbON/g9FDaEZhadXaqau5yQhxrfcTNUa\nau27/+rbQGlQslVrTB9Q4l3CcAz5+c08koxPL1JvAoGAUwR0gPJwQi00iyJvyECo\nLKPDQRoA9JbKBRiMNWjQTFPi+HuZNKgIN/msfkuPSl35o2g7iYfffpQFUryC9V55\nSR3NPF2NuU6dknakhZ0WDv5P0FEyTCMJqwaz5sDhM4RlQ43bXtvd6VsgrDlJqqPg\nouoRbQ9Z2EMRREcb4s93RTo=\n-----END PRIVATE KEY-----\n"
+}
