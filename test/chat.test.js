@@ -100,6 +100,36 @@ test('real-time messaging, permissions, groups, calls and persistence', async (t
     assert.equal(reply.message.replyTo.fromName, 'Aarav');
     const forward = await emit(a.s, 'send_message', { to: c.phone, text: h.messages[0].text, forwarded: true }); assert.equal(forward.message.forwarded, true);
   });
+  await t.test('notification replies are chat-scoped, idempotent, permission checked and revoked on logout', async () => {
+    const source = (await emit(a.s, 'send_message', { to: b.phone, text: 'Reply from the notification' })).message;
+    const context = { chat: a.phone, messageId: source.id };
+    assert.equal((await api('notifications/context', context)).status, 401);
+    assert.equal((await api('notifications/context', context, c.token)).status, 404);
+    assert.equal((await api('notifications/context', { ...context, privateMode: true }, b.token)).reply, null);
+    const { reply } = await api('notifications/context', context, b.token);
+    assert.ok(reply.token); assert.notEqual(reply.token, b.token);
+    const first = await api('notifications/reply', { token: reply.token, text: 'Sent without opening the app', to: c.phone });
+    assert.equal(first.status, 200);
+    assert.equal((await api('notifications/reply', { token: reply.token, text: 'Sent without opening the app' })).messageId, first.messageId);
+    assert.equal((await api('notifications/reply', { token: reply.token, text: 'Another message' })).status, 409);
+    const history = await emit(a.s, 'get_history', { with: b.phone });
+    assert.equal(history.messages.filter((message) => message.id === first.messageId).length, 1);
+    assert.equal(history.messages.find((message) => message.id === first.messageId).replyTo.id, source.id);
+    assert.ok(history.messages.find((message) => message.id === source.id).readBy.includes(b.phone));
+    const blocked = (await api('notifications/context', context, b.token)).reply;
+    await emit(b.s, 'preferences', { key: 'blocked', value: a.phone, enabled: true });
+    assert.equal((await api('notifications/reply', { token: blocked.token, text: 'Blocked reply' })).status, 403);
+    await emit(b.s, 'preferences', { key: 'blocked', value: a.phone, enabled: false });
+    const secondary = await api('auth/google', { credential: googleCredential('9000000002', 'Bela') });
+    const revoked = (await api('notifications/context', context, secondary.token)).reply;
+    await api('logout', {}, secondary.token);
+    assert.equal((await api('notifications/reply', { token: revoked.token, text: 'After logout' })).status, 410);
+    const restricted = (await emit(a.s, 'create_group', { name: 'Notification permissions', members: [b.phone] })).group;
+    const groupSource = (await emit(a.s, 'send_message', { to: restricted.id, text: 'Group announcement' })).message;
+    const groupReply = (await api('notifications/context', { chat: restricted.id, messageId: groupSource.id }, b.token)).reply;
+    await emit(a.s, 'group_settings', { id: restricted.id, adminsOnly: true });
+    assert.equal((await api('notifications/reply', { token: groupReply.token, text: 'Not an admin' })).status, 403);
+  });
   await t.test('offline contacts, queued delivery, notes, personal preferences and block', async () => {
     b.s.disconnect(); await delay(100);
     const offline = await emit(a.s, 'send_message', { to: b.phone, text: 'For later' }); assert.equal(offline.message.status, 'sent');

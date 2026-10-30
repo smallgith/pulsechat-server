@@ -16,6 +16,8 @@ import { installUploads, MAX_FILE_BYTES, CHUNK_BYTES } from './uploads.js';
 import { attachmentHeaders, installDownloads } from './downloads.js';
 import { localFileUrl } from './public-url.js';
 import { sessionStore, SESSION_DAYS } from './sessions.js';
+import { installNotificationReplies } from './notification-replies.js';
+import { publicServerUrl } from './public-url.js';
 import { structuredContent, installFeatures, startScheduler } from './features.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -243,11 +245,14 @@ app.post('/api/push/subscribe', requireAuth, (req, res) => {
   db.subscriptions[hash(s.endpoint)] = {
     phone: req.user,
     sessionKey: hash(req.headers.authorization.replace(/^Bearer /, '')),
+    apiUrl: publicServerUrl(req),
+    privateMode: req.body.privateMode === true,
     subscription: { endpoint: s.endpoint, keys: s.keys },
   };
   save();
   res.json({ ok: true });
 });
+let notificationReplies;
 const pushMessage = (m) => {
   const recipients = membersOf(m.roomId).filter((p) => p !== m.from);
   for (const [key, entry] of Object.entries(db.subscriptions)) {
@@ -268,20 +273,25 @@ const pushMessage = (m) => {
     )
       continue;
     const payload = {
+      type: 'message',
+      user: p,
+      messageId: m.id,
+      chat,
+      privateMode: entry.privateMode === true,
+      reply: notificationReplies?.issue({ owner: p, sessionKey: entry.sessionKey, source: m, apiUrl: entry.apiUrl, privateMode: entry.privateMode }),
       title: db.groups[m.roomId]?.name || m.fromName,
-      icon: db.accounts[m.from]?.avatarUrl || '/icon-192.png',
-      body:
-        m.text ||
+      icon: db.accounts[m.from]?.avatarUrl?.length < 512 ? db.accounts[m.from].avatarUrl : '/icon-192.png',
+      body: Array.from(`${db.groups[m.roomId] ? `${m.fromName}: ` : ''}${m.text ||
         m.task?.title ||
         m.poll?.question ||
         m.event?.title ||
         m.decision?.title ||
-        (m.voice ? 'Voice message' : m.gif ? 'GIF' : m.file?.name || 'New message'),
+        (m.voice ? 'Voice message' : m.gif ? 'GIF' : m.file?.name || 'New message')}`).slice(0, 240).join(''),
       tag: `chat-${m.roomId}`,
       url: `/?chat=${encodeURIComponent(chat)}`,
     };
     webpush
-      .sendNotification(entry.subscription, JSON.stringify(payload), { TTL: 86400, timeout: 10000 })
+      .sendNotification(entry.subscription, JSON.stringify(payload), { TTL: 86400, urgency: 'high', timeout: 10000 })
       .catch((e) => {
         if ([404, 410].includes(e.statusCode)) {
           delete db.subscriptions[key];
@@ -302,6 +312,7 @@ const pushIncomingCall = (c) => {
     if (visible) continue;
     webpush.sendNotification(entry.subscription, JSON.stringify({
       type: 'call',
+      user: c.to,
       title: db.accounts[c.from]?.name || 'Incoming call',
       icon: db.accounts[c.from]?.avatarUrl || '/icon-192.png',
       body: `Incoming ${c.type === 'video' ? 'video' : 'voice'} call · Tap to open PulseChat`,
@@ -589,6 +600,7 @@ const purgeExpired = () => {
       delete db.sessions[key];
       changed = true;
     }
+  if (notificationReplies?.cleanup()) changed = true;
   for (const [id, link] of pendingDeviceLinks) if (link.expires <= Date.now()) pendingDeviceLinks.delete(id);
   for (const [key, limit] of deviceLinkLimits) if (limit.until <= Date.now()) deviceLinkLimits.delete(key);
   if (changed) save();
@@ -672,6 +684,7 @@ const deliverMessage = (me, payload) => {
   const reply = list.find(
     (m) => m.id === payload.replyTo?.id && !m.deleted && !m.deletedFor?.includes(me)
   );
+  const notificationRead = payload.notificationReply === true && reply && !reply.readBy?.includes(me);
   const lifetime = db.groups[rid]?.disappearing || prefs(me).disappearing?.[to] || 0;
   const message = {
     id: randomUUID(),
@@ -703,6 +716,12 @@ const deliverMessage = (me, payload) => {
     readAt: { [me]: Date.now() },
     expiresAt: lifetime ? Date.now() + lifetime : null,
   };
+  if (notificationRead) {
+    (reply.readBy ||= []).push(me);
+    (reply.readAt ||= {})[me] = Date.now();
+    if (!reply.deliveredTo?.includes(me)) (reply.deliveredTo ||= []).push(me);
+    (reply.deliveredAt ||= {})[me] ||= Date.now();
+  }
   list.push(message);
   for (const p of members)
     prefs(p).hidden = prefs(p).hidden.filter(
@@ -710,9 +729,11 @@ const deliverMessage = (me, payload) => {
     );
   save();
   emitMessage(message, 'message');
+  if (notificationRead) emitMessage(reply);
   pushMessage(message);
   return message;
 };
+notificationReplies = installNotificationReplies(app, { db, save, requireAuth, canRead, roomId, deliver: deliverMessage });
 startScheduler({ db, save, deliverMessage, emitTo });
 io.on('connection', (socket) => {
   let me = null;
