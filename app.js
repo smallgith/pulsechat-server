@@ -214,7 +214,7 @@ app.get('/api/config', (_req, res) =>
     maxFiles: 20,
   })
 );
-app.get('/api/health', (_req, res) => res.json({ ok: true, online: online.size }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, online: online.size, storageConfigured: Boolean(process.env.DATA_DIR), storageWarning: process.env.RENDER && !process.env.DATA_DIR ? 'Configure persistent DATA_DIR to avoid losing history and sessions after deploys.' : undefined }));
 app.get('/api/session', requireAuth, (req, res) => res.json({
   ok: true, expiresAt: sessions.expires(req.headers.authorization?.replace(/^Bearer /, '')),
 }));
@@ -280,7 +280,8 @@ const pushMessage = (m) => {
       privateMode: entry.privateMode === true,
       reply: notificationReplies?.issue({ owner: p, sessionKey: entry.sessionKey, source: m, apiUrl: entry.apiUrl, privateMode: entry.privateMode }),
       title: db.groups[m.roomId]?.name || m.fromName,
-      icon: db.accounts[m.from]?.avatarUrl?.length < 512 ? db.accounts[m.from].avatarUrl : '/icon-192.png',
+      icon: db.accounts[m.from]?.avatarUrl?.length < 512 ? (db.accounts[m.from].avatarUrl.startsWith('/api/files/') ? `${(process.env.PUBLIC_SERVER_URL || (process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : '')).replace(/\/$/, '')}${db.accounts[m.from].avatarUrl}` : db.accounts[m.from].avatarUrl) : '/icon-192.png',
+      image: m.file?.mime?.startsWith('image/') && !m.viewOnce && !entry.privateMode ? (m.file.url.startsWith('/api/files/') ? `${(process.env.PUBLIC_SERVER_URL || (process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : '')).replace(/\/$/, '')}${m.file.url}` : m.file.url) : undefined,
       body: Array.from(`${db.groups[m.roomId] ? `${m.fromName}: ` : ''}${m.text ||
         m.task?.title ||
         m.poll?.question ||
@@ -477,7 +478,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
       fs.writeFileSync(path.join(uploadsDir, id), f.buffer);
       fs.writeFileSync(
         path.join(uploadsDir, `${id}.json`),
-        JSON.stringify({ name: f.originalname, mime: f.mimetype })
+        JSON.stringify({ name: f.originalname, mime: f.mimetype, owner: req.user })
       );
       url = localFileUrl(req, id);
     }
@@ -538,7 +539,7 @@ app.post('/api/ai-avatar', requireAuth, avatarPhotoUpload.single('selfie'), asyn
     if (bytes.length < 512 || bytes.length > 9 * 1024 * 1024) throw new Error('Unexpected image size');
     const id = randomUUID();
     fs.writeFileSync(path.join(uploadsDir, id), bytes);
-    fs.writeFileSync(path.join(uploadsDir, `${id}.json`), JSON.stringify({ name: 'ai-avatar.png', mime: 'image/png' }));
+    fs.writeFileSync(path.join(uploadsDir, `${id}.json`), JSON.stringify({ name: 'ai-avatar.png', mime: 'image/png', owner: req.user }));
     res.json({ ok: true, url: localFileUrl(req, id) });
   } catch (error) {
     console.error('Avatar generation failed:', error.message);
@@ -803,14 +804,19 @@ io.on('connection', (socket) => {
       founderPhone: founderPhone || null,
     });
     broadcastUsers();
-    for (const groupCall of groupCalls.values()) {
-      const group = db.groups[groupCall.groupId];
-      if (group?.members.includes(me) && !groupCall.participants.has(me))
-        socket.emit('group_call_invite', { callId: groupCall.callId,
-          groupId: groupCall.groupId, groupName: group.name,
-          from: groupCall.from, fromName: db.accounts[groupCall.from]?.name || 'Member',
-          type: groupCall.type });
-    }
+    // A first-time client attaches group-call listeners after the register ack.
+    // Emitting synchronously before that ack silently loses invitations.
+    setTimeout(() => {
+      if (!socket.connected) return;
+      for (const groupCall of groupCalls.values()) {
+        const group = db.groups[groupCall.groupId];
+        if (group?.members.includes(me) && !groupCall.participants.has(me))
+          socket.emit('group_call_invite', { callId: groupCall.callId,
+            groupId: groupCall.groupId, groupName: group.name,
+            from: groupCall.from, fromName: db.accounts[groupCall.from]?.name || 'Member',
+            type: groupCall.type });
+      }
+    }, 250);
     // When a PWA is opened from a call notification, redeliver the pending offer.
     for (const call of activeCalls.values()) {
       if (call.to === me && !call.answeredAt) socket.emit('incoming_call', {
@@ -957,7 +963,11 @@ io.on('connection', (socket) => {
     if (trim(name, 30).length < 2) return ackError(ack, 'Name must contain at least 2 characters');
     if (avatarUrl !== undefined) {
       const avatar = safeUrl(avatarUrl);
-      if (avatarUrl && (!avatar || !(
+      const localAvatar = /^\/api\/files\/[0-9a-f-]{36}$/i.test(avatarUrl) && (() => {
+        const fileId = avatarUrl.slice('/api/files/'.length);
+        try { return JSON.parse(fs.readFileSync(path.join(uploadsDir, `${fileId}.json`), 'utf8')).owner === me; } catch { return false; }
+      })();
+      if (avatarUrl && !localAvatar && (!avatar || !(
         /^https:\/\/res\.cloudinary\.com\//.test(avatar) ||
         ((() => {
           const u = new URL(avatar);
